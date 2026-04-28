@@ -1,4 +1,17 @@
-"""账号池管理 - 持久化存储所有账号状态"""
+"""账号池管理 - 持久化存储所有账号状态。
+
+每个 Team 管理员（"主号"）持有独立的账号池，文件位于
+``data/admins/{admin_id}/accounts.json``。
+
+兼容性:
+
+- 当调用方不传 ``admin_id`` 时，自动 fallback 到
+  ``admin_registry.get_active_admin_id()`` 拿当前激活 admin；
+  若仍无激活 admin（旧部署 / 未迁移）则使用模块级 ``ACCOUNTS_FILE``
+  作为兜底路径，便于旧测试 monkeypatch 该常量直接生效。
+"""
+
+from __future__ import annotations
 
 import json
 import time
@@ -9,6 +22,8 @@ from autoteam.mail_provider import build_account_mail_fields, get_mail_provider_
 from autoteam.textio import read_text, write_text
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+# 旧版部署的单实例文件路径；新结构下由 admin_registry.bootstrap_admin_registry 迁出。
 ACCOUNTS_FILE = PROJECT_ROOT / "accounts.json"
 
 # 账号状态
@@ -19,26 +34,65 @@ STATUS_PENDING = "pending"  # 已邀请，等待注册完成
 STATUS_AUTH_PENDING = "auth_pending"  # 已在 team 中，但 Codex 认证未就绪
 
 
+def _resolve_admin_id(admin_id: str | None) -> str | None:
+    """admin_id 缺省时回退到当前激活 admin。"""
+    if admin_id:
+        return admin_id
+    try:
+        from autoteam.admin_registry import get_active_admin_id
+
+        return get_active_admin_id()
+    except Exception:
+        return None
+
+
+def _accounts_file(admin_id: str | None = None) -> Path:
+    """根据 admin_id 计算 ``accounts.json`` 路径。
+
+    - admin_id 显式传入 → ``data/admins/{admin_id}/accounts.json``。
+    - admin_id 为空且当前有 active admin → 使用 active admin 的目录。
+    - admin_id 为空且无 active admin → 兜底到模块级 ``ACCOUNTS_FILE``
+      （兼容旧测试与未迁移部署）。
+    """
+    resolved = _resolve_admin_id(admin_id)
+    if resolved:
+        from autoteam.admin_registry import admin_data_dir
+
+        return admin_data_dir(resolved) / "accounts.json"
+    return ACCOUNTS_FILE
+
+
 def _normalized_email(value):
     return (value or "").strip().lower()
 
 
-def _is_main_account_email(email):
-    return bool(_normalized_email(email)) and _normalized_email(email) == _normalized_email(get_admin_email())
+def _is_main_account_email(email, admin_id: str | None = None):
+    if not _normalized_email(email):
+        return False
+    # 兼容旧测试：monkeypatch 把 get_admin_email 替换成无参 lambda，
+    # 此时调用带 admin_id 的新签名会 TypeError。先按新签名调用，失败时降级。
+    try:
+        admin_email = get_admin_email(admin_id)
+    except TypeError:
+        admin_email = get_admin_email()
+    return _normalized_email(email) == _normalized_email(admin_email)
 
 
-def load_accounts():
-    """加载账号列表"""
-    if ACCOUNTS_FILE.exists():
-        text = read_text(ACCOUNTS_FILE).strip()
+def load_accounts(admin_id: str | None = None):
+    """加载某 admin 的账号列表（缺省 = 当前激活 admin）。"""
+    path = _accounts_file(admin_id)
+    if path.exists():
+        text = read_text(path).strip()
         if text:
             return json.loads(text)
     return []
 
 
-def save_accounts(accounts):
-    """保存账号列表"""
-    write_text(ACCOUNTS_FILE, json.dumps(accounts, indent=2, ensure_ascii=False))
+def save_accounts(accounts, admin_id: str | None = None):
+    """保存账号列表（缺省 = 当前激活 admin）。"""
+    path = _accounts_file(admin_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_text(path, json.dumps(accounts, indent=2, ensure_ascii=False))
 
 
 def find_account(accounts, email):
@@ -49,9 +103,17 @@ def find_account(accounts, email):
     return None
 
 
-def add_account(email, password, cloudmail_account_id=None, *, mail_provider=None, mail_account_id=None):
-    """添加新账号"""
-    accounts = load_accounts()
+def add_account(
+    email,
+    password,
+    cloudmail_account_id=None,
+    *,
+    mail_provider=None,
+    mail_account_id=None,
+    admin_id: str | None = None,
+):
+    """添加新账号到指定 admin 的账号池（缺省 = 当前激活 admin）。"""
+    accounts = load_accounts(admin_id)
     if find_account(accounts, email):
         return  # 已存在
 
@@ -87,31 +149,35 @@ def add_account(email, password, cloudmail_account_id=None, *, mail_provider=Non
             "auth_retry_paused": False,
         }
     )
-    save_accounts(accounts)
+    save_accounts(accounts, admin_id=admin_id)
 
 
-def update_account(email, **kwargs):
-    """更新账号字段"""
-    accounts = load_accounts()
+def update_account(email, admin_id: str | None = None, **kwargs):
+    """更新账号字段（缺省 = 当前激活 admin）。"""
+    accounts = load_accounts(admin_id)
     acc = find_account(accounts, email)
     if acc:
         acc.update(kwargs)
-        save_accounts(accounts)
+        save_accounts(accounts, admin_id=admin_id)
     return acc
 
 
-def get_active_accounts():
-    """获取所有活跃账号"""
-    return [a for a in load_accounts() if a["status"] == STATUS_ACTIVE and not _is_main_account_email(a.get("email"))]
+def get_active_accounts(admin_id: str | None = None):
+    """获取所有活跃账号（不含主号自身）。"""
+    return [
+        a
+        for a in load_accounts(admin_id)
+        if a["status"] == STATUS_ACTIVE and not _is_main_account_email(a.get("email"), admin_id)
+    ]
 
 
-def get_standby_accounts():
+def get_standby_accounts(admin_id: str | None = None):
     """获取所有待命账号（已移出 team，可能额度已恢复）"""
-    accounts = load_accounts()
+    accounts = load_accounts(admin_id)
     now = time.time()
     standby = []
     for a in accounts:
-        if _is_main_account_email(a.get("email")):
+        if _is_main_account_email(a.get("email"), admin_id):
             continue
         if a["status"] == STATUS_STANDBY:
             resets_at = a.get("quota_resets_at")
@@ -127,9 +193,9 @@ def get_standby_accounts():
     return standby
 
 
-def get_next_reusable_account():
+def get_next_reusable_account(admin_id: str | None = None):
     """获取下一个可重用的 standby 账号（优先额度已恢复的）"""
-    standby = get_standby_accounts()
+    standby = get_standby_accounts(admin_id)
     if standby:
         return standby[0]
     return None

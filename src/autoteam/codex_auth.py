@@ -19,7 +19,12 @@ from autoteam.admin_state import (
     get_chatgpt_account_id,
     get_chatgpt_workspace_name,
 )
-from autoteam.auth_storage import AUTH_DIR, ensure_auth_dir, ensure_auth_file_permissions
+from autoteam.auth_storage import (
+    AUTH_DIR,  # noqa: F401  -- 保留 re-export 给 manager.py 等历史调用方
+    ensure_auth_dir,
+    ensure_auth_file_permissions,
+    get_auth_dir,
+)
 from autoteam.config import get_playwright_launch_options
 from autoteam.textio import write_text
 
@@ -144,10 +149,10 @@ def _exchange_auth_code(auth_code, code_verifier, fallback_email=None):
     return bundle
 
 
-def _write_auth_file(filepath, bundle):
+def _write_auth_file(filepath, bundle, *, admin_id: str | None = None):
     filepath = Path(filepath)
-    ensure_auth_dir()
-    filepath.parent.mkdir(exist_ok=True)
+    ensure_auth_dir(admin_id)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
 
     auth_data = {
         "type": "codex",
@@ -161,7 +166,7 @@ def _write_auth_file(filepath, bundle):
     }
 
     write_text(filepath, json.dumps(auth_data, indent=2))
-    ensure_auth_file_permissions(filepath)
+    ensure_auth_file_permissions(filepath, admin_id=admin_id)
     logger.info("[Codex] 认证文件已保存: %s", filepath)
     return str(filepath)
 
@@ -1426,9 +1431,12 @@ def login_main_codex():
     return login_codex_via_session()
 
 
-def save_auth_file(bundle):
-    """保存 CPA 兼容的认证文件。同一邮箱只保留一个文件，优先 team。"""
-    ensure_auth_dir()
+def save_auth_file(bundle, *, admin_id: str | None = None):
+    """保存 CPA 兼容的认证文件。同一邮箱只保留一个文件，优先 team。
+
+    :param admin_id: 目标 admin；缺省回退到当前激活 admin。
+    """
+    auth_dir = ensure_auth_dir(admin_id)
 
     email = bundle["email"]
     plan_type = bundle.get("plan_type", "unknown")
@@ -1436,38 +1444,41 @@ def save_auth_file(bundle):
     hash_id = hashlib.md5(account_id.encode()).hexdigest()[:8]
 
     # 清理同一邮箱的旧文件（避免 free/team 并存）
-    for old in AUTH_DIR.glob(f"codex-{email}-*.json"):
+    for old in auth_dir.glob(f"codex-{email}-*.json"):
         old.unlink()
         logger.info("[Codex] 清理旧文件: %s", old.name)
 
     filename = f"codex-{email}-{plan_type}-{hash_id}.json"
-    filepath = AUTH_DIR / filename
-    return _write_auth_file(filepath, bundle)
+    filepath = auth_dir / filename
+    return _write_auth_file(filepath, bundle, admin_id=admin_id)
 
 
-def save_main_auth_file(bundle):
+def save_main_auth_file(bundle, *, admin_id: str | None = None):
     """保存主号 Codex 认证文件，不进入账号池。"""
     account_id = bundle.get("account_id") or hashlib.md5(bundle.get("email", "main").encode()).hexdigest()[:8]
 
-    for old in AUTH_DIR.glob("codex-main-*.json"):
+    auth_dir = ensure_auth_dir(admin_id)
+    for old in auth_dir.glob("codex-main-*.json"):
         old.unlink()
         logger.info("[Codex] 清理旧主号文件: %s", old.name)
 
-    filepath = AUTH_DIR / f"codex-main-{account_id}.json"
-    return _write_auth_file(filepath, bundle)
+    filepath = auth_dir / f"codex-main-{account_id}.json"
+    return _write_auth_file(filepath, bundle, admin_id=admin_id)
 
 
-def get_saved_main_auth_file():
+def get_saved_main_auth_file(admin_id: str | None = None):
     """获取本地已保存的主号 Codex 认证文件路径。"""
+    auth_dir = get_auth_dir(admin_id)
     candidates = []
-    for path in AUTH_DIR.glob("codex-main-*.json"):
-        if not path.is_file():
-            continue
-        try:
-            stat = path.stat()
-        except Exception:
-            continue
-        candidates.append((stat.st_mtime, path.name, path))
+    if auth_dir.exists():
+        for path in auth_dir.glob("codex-main-*.json"):
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except Exception:
+                continue
+            candidates.append((stat.st_mtime, path.name, path))
 
     if not candidates:
         return ""

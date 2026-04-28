@@ -6,6 +6,7 @@ from pathlib import Path
 
 from autoteam.accounts import find_account, load_accounts, save_accounts
 from autoteam.admin_state import get_chatgpt_account_id
+from autoteam.auth_storage import get_auth_dir
 from autoteam.mail_provider import get_account_mail_account_id, get_account_mail_provider, get_mail_client
 from autoteam.sync_targets import delete_account_from_configured_targets
 from autoteam.sync_targets import sync_to_configured_targets as sync_to_cpa
@@ -13,7 +14,23 @@ from autoteam.sync_targets import sync_to_configured_targets as sync_to_cpa
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
+# 旧版部署的全局 ``auths/`` 目录；新结构下由 admin_registry.bootstrap_admin_registry 迁出。
+# 保留为模块常量是为了让旧测试可以通过 monkeypatch.setattr 直接覆盖该路径。
 AUTH_DIR = PROJECT_ROOT / "auths"
+
+
+def _resolve_auth_dir(admin_id: str | None = None) -> Path:
+    """返回当前应使用的 auths 目录。
+
+    旧测试通过 ``monkeypatch.setattr(account_ops, "AUTH_DIR", ...)`` 直接覆盖
+    模块常量；这种情况下要使用被覆盖后的 ``AUTH_DIR``。否则按 admin 维度
+    走 ``data/admins/{admin_id}/auths/``。
+    """
+    default_dir = PROJECT_ROOT / "auths"
+    if AUTH_DIR != default_dir:
+        # 模块常量被显式覆盖（例如测试 monkeypatch），尊重该值
+        return AUTH_DIR
+    return get_auth_dir(admin_id)
 
 
 def _response_excerpt(body, limit=240):
@@ -139,7 +156,7 @@ def delete_managed_account(
         auth_candidates = set()
         if acc and acc.get("auth_file"):
             auth_candidates.add(Path(acc["auth_file"]))
-        auth_candidates.update(AUTH_DIR.glob(f"codex-{email}-*.json"))
+        auth_candidates.update(_resolve_auth_dir().glob(f"codex-{email}-*.json"))
 
         for path in sorted(auth_candidates):
             if path.exists():
