@@ -2847,6 +2847,13 @@ def set_auto_check_config(cfg: AutoCheckConfig):
 @app.on_event("startup")
 def _start_auto_check():
     try:
+        from autoteam.admin_registry import bootstrap_admin_registry
+
+        bootstrap_admin_registry()
+    except Exception as exc:
+        logger.warning("[启动] admin_registry 初始化失败: %s", exc)
+
+    try:
         from autoteam.auth_storage import ensure_auth_file_permissions
 
         fixed = ensure_auth_file_permissions()
