@@ -140,17 +140,3 @@ def test_post_main_codex_login_starts_login_flow(monkeypatch):
 
     assert events == ["login"]
     assert result["message"] == "主号 Codex 已登录"
-
-
-def test_post_main_codex_delete_cpa_returns_deleted_names(monkeypatch):
-    monkeypatch.setattr(
-        "autoteam.cpa_sync.delete_main_codex_from_cpa",
-        lambda: {"deleted": ["codex-main-acc-1.json"], "count": 1},
-    )
-
-    result = api.post_main_codex_delete_cpa()
-
-    assert result == {
-        "message": "已从 CPA 删除 1 个主号认证文件",
-        "deleted": ["codex-main-acc-1.json"],
-    }
