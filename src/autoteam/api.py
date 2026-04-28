@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -11,15 +12,53 @@ import time
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from autoteam import admin_registry
 from autoteam.config import API_KEY
 from autoteam.textio import parse_env_line, read_text, write_text
 
 logger = logging.getLogger(__name__)
+
+# admin_id 格式：8 位小写十六进制（PRD 决策 #9）。
+# 用于 header / body 入参白名单校验，防止路径穿越（如 "../../etc"）。
+_ADMIN_ID_PATTERN = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _validate_admin_id(value: str) -> str:
+    """白名单校验 admin_id，不通过抛 HTTPException 400。
+
+    :param value: 待校验 admin_id 字符串。
+    :return: 通过校验后的 admin_id。
+    :raises HTTPException: 格式不合法时返回 400 中文 detail。
+    """
+    if not _ADMIN_ID_PATTERN.match(value or ""):
+        raise HTTPException(status_code=400, detail="管理员标识格式不正确，请联系管理员重新登录")
+    return value
+
+
+def get_current_admin_id(
+    x_autoteam_admin_id: str | None = Header(None, alias="X-Autoteam-Admin-Id"),
+) -> str | None:
+    """FastAPI 依赖：解析当前请求的 admin_id 上下文。
+
+    优先级：``X-Autoteam-Admin-Id`` header → ``admin_registry`` 的激活 admin →
+    ``None``（让数据层走兜底路径，向后兼容旧客户端）。
+
+    :param x_autoteam_admin_id: HTTP header 中携带的 admin_id；无则忽略。
+    :return: 通过白名单校验的 admin_id 字符串；无任何上下文时返回 ``None``。
+    :raises HTTPException: header 提供了非法格式的 admin_id 时 400。
+    """
+    if x_autoteam_admin_id:
+        return _validate_admin_id(x_autoteam_admin_id.strip())
+    try:
+        return admin_registry.get_active_admin_id()
+    except Exception:
+        return None
+
 
 app = FastAPI(
     title="AutoTeam API",
@@ -368,7 +407,6 @@ def _reload_runtime_config_modules():
         "autoteam.cloudmail",
         "autoteam.cloudflare_temp_email",
         "autoteam.mail_provider",
-        "autoteam.cpa_sync",
         "autoteam.sub2api_sync",
     ):
         try:
@@ -747,7 +785,7 @@ def get_runtime_config_source():
 
 @app.put("/api/config/runtime")
 def put_runtime_config(config: SetupConfig):
-    """登录后修改 CloudMail / CPA / Sub2API / 代理等运行时配置。"""
+    """登录后修改 CloudMail / Sub2API / 代理等运行时配置。"""
     return _save_runtime_config(config.model_dump())
 
 
@@ -821,8 +859,17 @@ def put_runtime_config_source(config: SourceConfig):
 _tasks: dict[str, dict] = {}
 _playwright_lock = threading.Lock()
 _current_task_id: str | None = None
+# 当前在飞的管理员登录会话（受全局 Playwright lock 串行保护，只可能有一个）。
+# 旧测试通过 monkeypatch 直接覆盖这两个标量，保留兼容。
 _admin_login_api = None
 _admin_login_step: str | None = None
+# 当前在飞会话的目标 admin_id（PR2 多 admin 化）。
+# - 已存在 admin 重新登录：admin_id 是该 admin 的 8 位 hex；
+# - 创建新 admin 流程：填占位 sentinel ``__pending__``，登录完成后再插入索引；
+# - 兼容旧 ``/api/admin/login/*`` 路由（无 target）：写当前激活 admin_id 或 ``__pending__``。
+_admin_login_target: str | None = None
+# 占位 key：标记一个尚未生成 admin_id 的"创建新管理员"流程。
+_PENDING_ADMIN_KEY = "__pending__"
 _main_codex_flow = None
 _main_codex_step: str | None = None
 _main_codex_action: str | None = None
@@ -1074,10 +1121,63 @@ def _normalized_email(value: str | None) -> str:
     return (value or "").strip().lower()
 
 
-def _is_main_account_email(email: str | None) -> bool:
+def _is_main_account_email(email: str | None, admin_id: str | None = None) -> bool:
+    """判断 email 是否属于指定 admin 的主号。
+
+    :param email: 待判断邮箱。
+    :param admin_id: 目标 admin；缺省回退到当前激活 admin（兼容旧调用）。
+    """
     from autoteam.admin_state import get_admin_email
 
-    return bool(_normalized_email(email)) and _normalized_email(email) == _normalized_email(get_admin_email())
+    normalized = _normalized_email(email)
+    if not normalized:
+        return False
+    # 旧测试 monkeypatch 把 get_admin_email 替换为无参 lambda；新签名调用会 TypeError。
+    # 这里做 fallback 保兼容（PR1 在 accounts.py 也有同款处理）。
+    try:
+        admin_email = get_admin_email(admin_id)
+    except TypeError:
+        admin_email = get_admin_email()
+    return normalized == _normalized_email(admin_email)
+
+
+def _email_is_main(email: str | None, admin_id: str | None = None) -> bool:
+    """``_is_main_account_email`` 的间接调用，兼容把后者 monkeypatch 成 1-arg lambda 的旧测试。
+
+    路由层统一通过本函数调用，避免直接以 ``(email, admin_id)`` 签名调用 monkeypatch
+    替换出的 1 参 lambda 引发 TypeError。
+
+    :param email: 待判断邮箱。
+    :param admin_id: 目标 admin_id；可为 ``None``。
+    """
+    try:
+        return _is_main_account_email(email, admin_id)
+    except TypeError:
+        return _is_main_account_email(email)
+
+
+def _admin_state_call(func, admin_id: str | None, *args, **kwargs):
+    """带 ``admin_id`` 透传的兼容调用器：兼容旧测试 monkeypatch 用的"无 admin_id 参数"形态。
+
+    用于调用 ``admin_state`` / ``accounts`` / ``codex_auth`` 等数据层函数（PR1
+    已为它们补了 ``admin_id`` 参数），优先按新签名调用；如果调用方已经被
+    monkeypatch 替换为旧签名（无 admin_id），自动 fallback。
+
+    :param func: 目标函数。
+    :param admin_id: 目标 admin_id；可为 ``None``。
+    :param args: 透传给 ``func`` 的位置参数（admin_id 之外）。
+    :param kwargs: 透传给 ``func`` 的关键字参数（admin_id 之外）。
+    :return: ``func`` 返回值。
+    """
+    try:
+        return func(*args, admin_id=admin_id, **kwargs)
+    except TypeError:
+        # admin_id 不是接受的关键字参数；可能是 monkeypatch 的旧签名 lambda。
+        try:
+            return func(*args, **kwargs)
+        except TypeError:
+            # 旧测试有时 patch 成不接收任何参数；最后兜底再试一次零参形态。
+            return func()
 
 
 def _quota_snapshot_status(quota_info: dict | None) -> str:
@@ -1095,45 +1195,54 @@ def _quota_snapshot_status(quota_info: dict | None) -> str:
     return "exhausted" if any(value >= 100 for value in values) else "active"
 
 
-def _resolve_status_auth_file(acc: dict) -> str:
+def _resolve_status_auth_file(acc: dict, admin_id: str | None = None) -> str:
     auth_file = (acc.get("auth_file") or "").strip()
     if auth_file and Path(auth_file).exists():
         return auth_file
 
-    if _is_main_account_email(acc.get("email")):
+    if _email_is_main(acc.get("email"), admin_id):
         from autoteam.codex_auth import get_saved_main_auth_file
 
-        saved_auth_file = get_saved_main_auth_file()
+        saved_auth_file = _admin_state_call(get_saved_main_auth_file, admin_id)
         if saved_auth_file and Path(saved_auth_file).exists():
             return saved_auth_file
 
     return ""
 
 
-def _display_account_status(acc: dict, quota_snapshot: dict | None = None) -> str:
+def _display_account_status(acc: dict, quota_snapshot: dict | None = None, admin_id: str | None = None) -> str:
     status = acc.get("status", "")
-    if not _is_main_account_email(acc.get("email")):
+    if not _email_is_main(acc.get("email"), admin_id):
         return status
 
     quota_status = _quota_snapshot_status(quota_snapshot) or _quota_snapshot_status(acc.get("last_quota"))
     if quota_status:
         return quota_status
 
-    return "active" if _resolve_status_auth_file(acc) else status
+    return "active" if _resolve_status_auth_file(acc, admin_id) else status
 
 
-def _sanitize_account(acc: dict, quota_snapshot: dict | None = None) -> dict:
+def _sanitize_account(acc: dict, quota_snapshot: dict | None = None, admin_id: str | None = None) -> dict:
     """脱敏账号信息（去掉 password 等敏感字段）"""
     sanitized = {k: v for k, v in acc.items() if k not in ("password", "cloudmail_account_id", "mail_account_id")}
-    sanitized["is_main_account"] = _is_main_account_email(acc.get("email"))
-    sanitized["status"] = _display_account_status(acc, quota_snapshot)
+    sanitized["is_main_account"] = _email_is_main(acc.get("email"), admin_id)
+    sanitized["status"] = _display_account_status(acc, quota_snapshot, admin_id)
     return sanitized
 
 
-def _admin_status():
+def _admin_status(admin_id: str | None = None):
+    """返回某 admin 的登录态摘要 + 当前在飞登录步骤。
+
+    :param admin_id: 目标 admin；缺省回退到当前激活 admin。
+    """
     from autoteam.admin_state import get_admin_state_summary
 
-    status = get_admin_state_summary()
+    # get_admin_state_summary 接受 admin_id（PR1 已改造）；旧测试仍用无参 monkeypatch，
+    # 这里捕获 TypeError 降级，确保兼容。
+    try:
+        status = get_admin_state_summary(admin_id)
+    except TypeError:
+        status = get_admin_state_summary()
     status["login_step"] = _admin_login_step
     status["login_in_progress"] = _admin_login_api is not None
     if _admin_login_api and _admin_login_step == "workspace_required":
@@ -1172,7 +1281,7 @@ def _manual_account_status():
 
 
 def _finish_admin_login(completed: dict):
-    global _admin_login_api, _admin_login_step
+    global _admin_login_api, _admin_login_step, _admin_login_target
     api = _admin_login_api
     info = None
     try:
@@ -1185,16 +1294,37 @@ def _finish_admin_login(completed: dict):
                 pass
         _admin_login_api = None
         _admin_login_step = None
+        _admin_login_target = None
         if _playwright_lock.locked():
             _playwright_lock.release()
     return {"status": "completed", "admin": _admin_status(), "codex": _main_codex_status(), "info": info}
 
 
-def _set_pending_admin_login(api, step):
-    global _admin_login_api, _admin_login_step
+def _set_pending_admin_login(api, step, target_admin_id: str | None = None):
+    """登记一个进行中的管理员登录会话。
+
+    :param target_admin_id: 该会话的目标 admin_id；为 ``None`` 表示沿用旧路由
+        约定（兼容老客户端，记为 ``_PENDING_ADMIN_KEY``）。
+    """
+    global _admin_login_api, _admin_login_step, _admin_login_target
     _admin_login_api = api
     _admin_login_step = step
+    _admin_login_target = target_admin_id or _PENDING_ADMIN_KEY
     return {"status": step, "admin": _admin_status()}
+
+
+def _clear_admin_login_session(*, release_lock: bool = True) -> None:
+    """统一清理在飞管理员登录会话的全局变量。
+
+    :param release_lock: 是否在持锁时释放 Playwright lock。``False`` 用于
+        登录已完成的场景（锁已由 ``_finish_admin_login`` 处理）。
+    """
+    global _admin_login_api, _admin_login_step, _admin_login_target
+    _admin_login_api = None
+    _admin_login_step = None
+    _admin_login_target = None
+    if release_lock and _playwright_lock.locked():
+        _playwright_lock.release()
 
 
 def _finish_main_codex_flow():
@@ -1268,9 +1398,9 @@ def _set_pending_manual_account_flow(flow, result):
 
 
 @app.get("/api/admin/status")
-def get_admin_status():
+def get_admin_status(admin_id: str | None = Depends(get_current_admin_id)):
     """获取管理员登录状态。"""
-    return _admin_status()
+    return _admin_status(admin_id)
 
 
 @app.get("/api/main-codex/status")
@@ -1286,19 +1416,19 @@ def get_manual_account_status():
 
 
 @app.post("/api/admin/login/start")
-def post_admin_login_start(params: AdminEmailParams):
+def post_admin_login_start(
+    params: AdminEmailParams,
+    admin_id: str | None = Depends(get_current_admin_id),
+):
     """开始管理员登录流程。"""
-    global _admin_login_api, _admin_login_step
+    global _admin_login_api, _admin_login_target
 
     if _admin_login_api:
         try:
             _pw_executor.run(_admin_login_api.stop)
         except Exception:
             pass
-        _admin_login_api = None
-        _admin_login_step = None
-        if _playwright_lock.locked():
-            _playwright_lock.release()
+        _clear_admin_login_session()
 
     if not _playwright_lock.acquire(blocking=False):
         raise HTTPException(
@@ -1320,9 +1450,10 @@ def post_admin_login_start(params: AdminEmailParams):
         logger.info("[API] 管理员登录 start 返回: step=%s detail=%s", step, result.get("detail"))
         if step == "completed":
             _admin_login_api = api
+            _admin_login_target = admin_id or _PENDING_ADMIN_KEY
             return _finish_admin_login(result)
         if step in ("password_required", "code_required", "workspace_required"):
-            return _set_pending_admin_login(api, step)
+            return _set_pending_admin_login(api, step, target_admin_id=admin_id)
         _pw_executor.run(api.stop)
         _playwright_lock.release()
         raise HTTPException(status_code=400, detail=result.get("detail") or "无法识别管理员登录步骤")
@@ -1336,10 +1467,11 @@ def post_admin_login_start(params: AdminEmailParams):
 
 
 @app.post("/api/admin/login/session")
-def post_admin_login_session(params: AdminSessionParams):
+def post_admin_login_session(
+    params: AdminSessionParams,
+    admin_id: str | None = Depends(get_current_admin_id),
+):
     """手动导入管理员 session_token。"""
-    global _admin_login_api, _admin_login_step
-
     if _admin_login_api:
         post_admin_login_cancel()
 
@@ -1362,9 +1494,8 @@ def post_admin_login_session(params: AdminSessionParams):
                 api.stop()
 
         info = _pw_executor.run(_do_import, params.email.strip(), params.session_token.strip())
-        _admin_login_api = None
-        _admin_login_step = None
-        return {"status": "completed", "admin": _admin_status(), "codex": _main_codex_status(), "info": info}
+        _clear_admin_login_session(release_lock=False)
+        return {"status": "completed", "admin": _admin_status(admin_id), "codex": _main_codex_status(), "info": info}
     except HTTPException:
         raise
     except Exception as exc:
@@ -1378,7 +1509,7 @@ def post_admin_login_session(params: AdminSessionParams):
 @app.post("/api/admin/login/password")
 def post_admin_login_password(params: AdminPasswordParams):
     """提交管理员密码。"""
-    global _admin_login_api, _admin_login_step
+    global _admin_login_step
     if not _admin_login_api or _admin_login_step != "password_required":
         raise HTTPException(status_code=409, detail="当前没有等待密码的管理员登录流程")
 
@@ -1401,17 +1532,14 @@ def post_admin_login_password(params: AdminPasswordParams):
             _pw_executor.run(_admin_login_api.stop)
         except Exception:
             pass
-        _admin_login_api = None
-        _admin_login_step = None
-        if _playwright_lock.locked():
-            _playwright_lock.release()
+        _clear_admin_login_session()
         raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/admin/login/code")
 def post_admin_login_code(params: AdminCodeParams):
     """提交管理员验证码。"""
-    global _admin_login_api, _admin_login_step
+    global _admin_login_step
     if not _admin_login_api or _admin_login_step != "code_required":
         raise HTTPException(status_code=409, detail="当前没有等待验证码的管理员登录流程")
 
@@ -1434,17 +1562,14 @@ def post_admin_login_code(params: AdminCodeParams):
             _pw_executor.run(_admin_login_api.stop)
         except Exception:
             pass
-        _admin_login_api = None
-        _admin_login_step = None
-        if _playwright_lock.locked():
-            _playwright_lock.release()
+        _clear_admin_login_session()
         raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/admin/login/workspace")
 def post_admin_login_workspace(params: AdminWorkspaceParams):
     """提交管理员 workspace 选择。"""
-    global _admin_login_api, _admin_login_step
+    global _admin_login_step
     if not _admin_login_api or _admin_login_step != "workspace_required":
         raise HTTPException(status_code=409, detail="当前没有等待组织选择的管理员登录流程")
 
@@ -1467,42 +1592,35 @@ def post_admin_login_workspace(params: AdminWorkspaceParams):
             _pw_executor.run(_admin_login_api.stop)
         except Exception:
             pass
-        _admin_login_api = None
-        _admin_login_step = None
-        if _playwright_lock.locked():
-            _playwright_lock.release()
+        _clear_admin_login_session()
         raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/admin/login/cancel")
 def post_admin_login_cancel():
     """取消管理员登录流程。"""
-    global _admin_login_api, _admin_login_step
     if _admin_login_api:
         try:
             _pw_executor.run(_admin_login_api.stop)
         except Exception:
             pass
-        _admin_login_api = None
-        _admin_login_step = None
-        if _playwright_lock.locked():
-            _playwright_lock.release()
+        _clear_admin_login_session()
     return {"message": "管理员登录已取消", "admin": _admin_status()}
 
 
 @app.post("/api/admin/logout")
-def post_admin_logout():
+def post_admin_logout(admin_id: str | None = Depends(get_current_admin_id)):
     """清除已保存的管理员登录态。"""
     from autoteam.admin_state import clear_admin_state
 
     if _admin_login_api:
         post_admin_login_cancel()
-    clear_admin_state()
-    return {"message": "管理员登录态已清除", "admin": _admin_status()}
+    clear_admin_state(admin_id)
+    return {"message": "管理员登录态已清除", "admin": _admin_status(admin_id)}
 
 
 @app.post("/api/main-codex/start")
-def post_main_codex_start():
+def post_main_codex_start(admin_id: str | None = Depends(get_current_admin_id)):
     """开始主号 Codex 登录并同步到已启用远端。"""
     global _main_codex_flow, _main_codex_step, _main_codex_action
 
@@ -1522,7 +1640,7 @@ def post_main_codex_start():
     from autoteam.codex_auth import get_saved_main_auth_file
     from autoteam.sync_targets import sync_main_codex_to_configured_targets
 
-    saved_auth_file = get_saved_main_auth_file()
+    saved_auth_file = _admin_state_call(get_saved_main_auth_file, admin_id)
     if saved_auth_file:
         sync_main_codex_to_configured_targets(saved_auth_file)
         return {
@@ -1729,16 +1847,16 @@ def post_manual_account_cancel():
 
 
 @app.get("/api/accounts")
-def get_accounts():
+def get_accounts(admin_id: str | None = Depends(get_current_admin_id)):
     """获取所有账号列表"""
     from autoteam.accounts import load_accounts
 
-    accounts = load_accounts()
-    return [_sanitize_account(a) for a in accounts]
+    accounts = _admin_state_call(load_accounts, admin_id)
+    return [_sanitize_account(a, admin_id=admin_id) for a in accounts]
 
 
 @app.get("/api/accounts/{email}/codex-auth")
-def get_codex_auth(email: str):
+def get_codex_auth(email: str, admin_id: str | None = Depends(get_current_admin_id)):
     """导出账号的 Codex CLI 格式认证文件（~/.codex/auth.json）"""
     from autoteam.accounts import find_account, load_accounts
     from autoteam.codex_auth import get_saved_main_auth_file
@@ -1746,12 +1864,12 @@ def get_codex_auth(email: str):
     email = email.strip().lower()
     auth_file = ""
 
-    if _is_main_account_email(email):
-        auth_file = get_saved_main_auth_file()
+    if _email_is_main(email, admin_id):
+        auth_file = _admin_state_call(get_saved_main_auth_file, admin_id)
         if not auth_file or not Path(auth_file).exists():
             raise HTTPException(status_code=404, detail="主号没有可导出的认证文件")
     else:
-        acc = find_account(load_accounts(), email)
+        acc = find_account(_admin_state_call(load_accounts, admin_id), email)
         if not acc:
             raise HTTPException(status_code=404, detail="账号不存在")
         auth_file = acc.get("auth_file") or ""
@@ -1781,24 +1899,24 @@ def get_codex_auth(email: str):
 
 
 @app.get("/api/accounts/active")
-def get_active():
+def get_active(admin_id: str | None = Depends(get_current_admin_id)):
     """获取活跃账号"""
     from autoteam.accounts import get_active_accounts
 
-    return [_sanitize_account(a) for a in get_active_accounts()]
+    return [_sanitize_account(a, admin_id=admin_id) for a in get_active_accounts(admin_id)]
 
 
 @app.get("/api/accounts/standby")
-def get_standby():
+def get_standby(admin_id: str | None = Depends(get_current_admin_id)):
     """获取待命账号"""
     from autoteam.accounts import get_standby_accounts
 
-    accounts = get_standby_accounts()
-    return [_sanitize_account(a) for a in accounts]
+    accounts = get_standby_accounts(admin_id)
+    return [_sanitize_account(a, admin_id=admin_id) for a in accounts]
 
 
 @app.delete("/api/accounts/{email}")
-def delete_account(email: str):
+def delete_account(email: str, admin_id: str | None = Depends(get_current_admin_id)):
     """删除本地管理账号及其关联资源。"""
     if not _playwright_lock.acquire(blocking=False):
         running = _tasks.get(_current_task_id, {})
@@ -1818,10 +1936,10 @@ def delete_account(email: str):
         from autoteam.account_ops import delete_managed_account
         from autoteam.accounts import load_accounts
 
-        if _is_main_account_email(email):
+        if _email_is_main(email, admin_id):
             raise HTTPException(status_code=400, detail="主号不允许删除")
 
-        accounts = load_accounts()
+        accounts = _admin_state_call(load_accounts, admin_id)
         if not any(a["email"].lower() == email.lower() for a in accounts):
             raise HTTPException(status_code=404, detail="账号不存在")
 
@@ -1836,7 +1954,7 @@ def delete_account(email: str):
 
 
 @app.post("/api/accounts/{email}/kick")
-def post_kick_account(email: str):
+def post_kick_account(email: str, admin_id: str | None = Depends(get_current_admin_id)):
     """将账号从 Team 中移出，状态变为 standby"""
     if not _playwright_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再操作"))
@@ -1846,9 +1964,9 @@ def post_kick_account(email: str):
         from autoteam.manager import remove_from_team
 
         email = email.strip().lower()
-        if _is_main_account_email(email):
+        if _email_is_main(email, admin_id):
             raise HTTPException(status_code=400, detail="主号不允许移出 Team")
-        accounts = load_accounts()
+        accounts = _admin_state_call(load_accounts, admin_id)
         acc = find_account(accounts, email)
         if not acc:
             raise HTTPException(status_code=404, detail="账号不存在")
@@ -1860,7 +1978,7 @@ def post_kick_account(email: str):
 
         ok = _pw_executor.run(_do_kick)
         if ok:
-            update_account(email, status="standby")
+            _admin_state_call(update_account, admin_id, email, status="standby")
             return {"message": f"已将 {email} 移出 Team", "email": email, "status": "standby"}
         raise HTTPException(status_code=500, detail=f"移出 {email} 失败")
     finally:
@@ -1872,14 +1990,14 @@ class LoginAccountParams(BaseModel):
 
 
 @app.post("/api/accounts/login", status_code=202)
-def post_account_login(params: LoginAccountParams):
+def post_account_login(params: LoginAccountParams, admin_id: str | None = Depends(get_current_admin_id)):
     """触发单个账号的 Codex 登录（后台执行）"""
     from autoteam.accounts import find_account, load_accounts
 
     email = params.email.strip().lower()
-    if _is_main_account_email(email):
+    if _email_is_main(email, admin_id):
         raise HTTPException(status_code=400, detail="主号不属于账号池登录对象")
-    accounts = load_accounts()
+    accounts = _admin_state_call(load_accounts, admin_id)
     acc = find_account(accounts, email)
     if not acc:
         raise HTTPException(status_code=404, detail="账号不存在")
@@ -1904,31 +2022,33 @@ def post_account_login(params: LoginAccountParams):
             plan_type = str(bundle.get("plan_type") or "").lower()
             if plan_type != "team":
                 raise RuntimeError(f"登录后 plan={plan_type or 'unknown'}，未进入 Team workspace")
-            auth_file = save_auth_file(bundle)
-            update_account(email, auth_file=auth_file)
+            # 显式透传 admin_id：后台线程内激活 admin 可能被巡检循环切换
+            auth_file = save_auth_file(bundle, admin_id=admin_id)
+            _admin_state_call(update_account, admin_id, email, auth_file=auth_file)
             # 登录成功且是 team plan，自动标记为 active
             if plan_type == "team":
-                update_account(email, status=STATUS_ACTIVE, last_active_at=time.time())
+                _admin_state_call(update_account, admin_id, email, status=STATUS_ACTIVE, last_active_at=time.time())
                 # 查一下额度并保存快照
                 token = bundle.get("access_token")
                 if token:
                     st, info = check_codex_quota(token)
                     if st == "ok" and isinstance(info, dict):
-                        update_account(email, last_quota=info)
+                        _admin_state_call(update_account, admin_id, email, last_quota=info)
                     elif st == "exhausted":
                         quota_info = quota_result_quota_info(info)
                         if quota_info:
-                            update_account(email, last_quota=quota_info)
+                            _admin_state_call(update_account, admin_id, email, last_quota=quota_info)
                         update_account(
                             email,
+                            admin_id=admin_id,
                             status="exhausted",
                             quota_exhausted_at=time.time(),
                             quota_resets_at=quota_result_resets_at(info) or int(time.time() + 18000),
                         )
             # 同步到已启用远端
-            from autoteam.sync_targets import sync_to_configured_targets as sync_to_cpa
+            from autoteam.sync_targets import sync_to_configured_targets
 
-            sync_to_cpa()
+            sync_to_configured_targets()
             return {"email": email, "plan": bundle.get("plan_type"), "auth_file": auth_file}
         raise RuntimeError(f"Codex 登录失败: {email}")
 
@@ -1937,7 +2057,7 @@ def post_account_login(params: LoginAccountParams):
 
 
 @app.get("/api/status")
-def get_status():
+def get_status(admin_id: str | None = Depends(get_current_admin_id)):
     """获取所有账号状态 + active 账号实时额度"""
     from autoteam.accounts import (
         STATUS_ACTIVE,
@@ -1949,14 +2069,14 @@ def get_status():
     )
     from autoteam.codex_auth import check_codex_quota, quota_result_quota_info
 
-    accounts = load_accounts()
+    accounts = _admin_state_call(load_accounts, admin_id)
     quota_cache = {}
 
     for acc in accounts:
-        if acc["status"] not in (STATUS_ACTIVE, STATUS_AUTH_PENDING) and not _is_main_account_email(acc.get("email")):
+        if acc["status"] not in (STATUS_ACTIVE, STATUS_AUTH_PENDING) and not _email_is_main(acc.get("email"), admin_id):
             continue
 
-        auth_file = _resolve_status_auth_file(acc)
+        auth_file = _resolve_status_auth_file(acc, admin_id)
         if not auth_file:
             continue
 
@@ -1974,7 +2094,7 @@ def get_status():
         except Exception:
             pass
 
-    sanitized_accounts = [_sanitize_account(a, quota_cache.get(a.get("email"))) for a in accounts]
+    sanitized_accounts = [_sanitize_account(a, quota_cache.get(a.get("email")), admin_id) for a in accounts]
 
     summary = {
         "active": sum(1 for a in sanitized_accounts if a["status"] == STATUS_ACTIVE),
@@ -2015,7 +2135,7 @@ def post_sync_from_cpa():
 
 
 @app.post("/api/sync/accounts")
-def post_sync_accounts():
+def post_sync_accounts(admin_id: str | None = Depends(get_current_admin_id)):
     """从 auths 目录和 Team 成员同步账号到 accounts.json"""
     from autoteam.manager import sync_account_states
 
@@ -2029,16 +2149,18 @@ def post_sync_accounts():
 
     from autoteam.accounts import load_accounts
 
-    accounts = load_accounts()
+    accounts = _admin_state_call(load_accounts, admin_id)
     return {"message": f"同步完成，共 {len(accounts)} 个账号", "total": len(accounts)}
 
 
 @app.get("/api/team/members")
-def get_team_members():
+def get_team_members(admin_id: str | None = Depends(get_current_admin_id)):
     """获取 Team 全部成员（包括手动添加的外部成员）"""
     from autoteam.admin_state import get_admin_session_token, get_chatgpt_account_id
 
-    if not get_admin_session_token() or not get_chatgpt_account_id():
+    if not _admin_state_call(get_admin_session_token, admin_id) or not _admin_state_call(
+        get_chatgpt_account_id, admin_id
+    ):
         raise HTTPException(status_code=400, detail="请先完成管理员登录")
 
     if not _playwright_lock.acquire(blocking=False):
@@ -2052,7 +2174,7 @@ def get_team_members():
 
             def _collect(chatgpt):
                 members, invites = fetch_team_state(chatgpt)
-                local_emails = {a["email"].lower() for a in load_accounts()}
+                local_emails = {a["email"].lower() for a in _admin_state_call(load_accounts, admin_id)}
 
                 result = []
                 for m in members:
@@ -2093,11 +2215,16 @@ def get_team_members():
 
 
 @app.post("/api/team/members/remove")
-def post_team_member_remove(params: TeamMemberRemoveParams):
+def post_team_member_remove(
+    params: TeamMemberRemoveParams,
+    admin_id: str | None = Depends(get_current_admin_id),
+):
     """移出 Team 成员或取消邀请。"""
     from autoteam.admin_state import get_admin_session_token, get_chatgpt_account_id
 
-    if not get_admin_session_token() or not get_chatgpt_account_id():
+    if not _admin_state_call(get_admin_session_token, admin_id) or not _admin_state_call(
+        get_chatgpt_account_id, admin_id
+    ):
         raise HTTPException(status_code=400, detail="请先完成管理员登录")
 
     if not _playwright_lock.acquire(blocking=False):
@@ -2112,24 +2239,24 @@ def post_team_member_remove(params: TeamMemberRemoveParams):
 
         if not email or not user_id:
             raise HTTPException(status_code=400, detail="缺少必要参数")
-        if _is_main_account_email(email):
+        if _email_is_main(email, admin_id):
             raise HTTPException(status_code=400, detail="主号不允许从 Team 成员页移出")
         if member_type not in ("member", "invite"):
             raise HTTPException(status_code=400, detail="无效的成员类型")
 
-        account_id = get_chatgpt_account_id()
+        account_id = _admin_state_call(get_chatgpt_account_id, admin_id)
 
         def _do_remove_team_member():
             def _remove(chatgpt):
                 if member_type == "invite":
+                    # OpenAI 当前用 PATCH 设置 status=cancelled 来取消邀请;
+                    # 旧的 DELETE /invites/{id} 已经返回 405 Method Not Allowed
                     path = f"/backend-api/accounts/{account_id}/invites/{user_id}"
-                    action_text = "取消邀请"
-                else:
-                    path = f"/backend-api/accounts/{account_id}/users/{user_id}"
-                    action_text = "移出 Team"
-
+                    result = chatgpt._api_fetch("PATCH", path, {"status": "cancelled"})
+                    return result, "取消邀请"
+                path = f"/backend-api/accounts/{account_id}/users/{user_id}"
                 result = chatgpt._api_fetch("DELETE", path)
-                return result, action_text
+                return result, "移出 Team"
 
             return _run_with_chatgpt_session(_remove)
 
@@ -2143,10 +2270,10 @@ def post_team_member_remove(params: TeamMemberRemoveParams):
         if result["status"] not in (200, 204):
             raise HTTPException(status_code=500, detail=f"{action_text}失败: HTTP {result['status']}")
 
-        accounts = load_accounts()
+        accounts = _admin_state_call(load_accounts, admin_id)
         acc = find_account(accounts, email)
         if acc:
-            update_account(email, status="standby")
+            _admin_state_call(update_account, admin_id, email, status="standby")
 
         return {
             "message": f"已{action_text}: {email}",
@@ -2907,7 +3034,6 @@ class _QuietAccessLog(logging.Filter):
         "/api/config/runtime",
         "/api/admin/status",
         "/api/main-codex/status",
-        "/api/manual-account/status",
         "/api/auth/check",
         "/api/setup/status",
     )

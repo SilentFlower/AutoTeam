@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import time
 import uuid
@@ -67,6 +68,22 @@ ADMIN_DATA_FILE_MODE = 0o666
 ADMIN_DATA_DIR_MODE = 0o777
 
 _INDEX_FILENAME = "admins.json"
+
+# admin_id 白名单：8 位小写十六进制（PRD 决策 #9）。
+# 用于阻止外部传入的非法 admin_id 触发路径穿越（如 ``../../etc``）。
+_ADMIN_ID_PATTERN = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _validate_admin_id(admin_id: str) -> str:
+    """对外部传入的 admin_id 做白名单校验。
+
+    :param admin_id: 待校验字符串。
+    :return: 通过校验的 admin_id。
+    :raises ValueError: 格式不合法时抛出，调用方需翻译成 4xx HTTP 响应。
+    """
+    if not isinstance(admin_id, str) or not _ADMIN_ID_PATTERN.match(admin_id):
+        raise ValueError(f"admin_id 必须是 8 位小写十六进制：{admin_id!r}")
+    return admin_id
 
 
 @dataclass
@@ -126,9 +143,11 @@ def admin_data_dir(admin_id: str) -> Path:
 
     :param admin_id: 8 位 admin_id。
     :return: ``data/admins/{admin_id}/`` 的 ``Path`` 对象。
+    :raises ValueError: admin_id 非法（非 8 位 hex）时抛出，避免路径穿越。
     """
     if not admin_id:
         raise ValueError("admin_id 不能为空")
+    _validate_admin_id(admin_id)
     return ADMINS_DIR / admin_id
 
 
@@ -274,8 +293,11 @@ def add_admin(admin: Admin) -> Admin:
 
     if not admin.admin_id:
         admin.admin_id = _generate_admin_id(existing_ids)
-    elif admin.admin_id in existing_ids:
-        raise ValueError(f"admin_id 已存在: {admin.admin_id}")
+    else:
+        # 外部传入的 admin_id 必须先过白名单（防止路径穿越）。
+        _validate_admin_id(admin.admin_id)
+        if admin.admin_id in existing_ids:
+            raise ValueError(f"admin_id 已存在: {admin.admin_id}")
 
     if not admin.alias:
         admin.alias = _derive_alias(admin)
@@ -322,6 +344,7 @@ def set_active_admin(admin_id: str) -> Admin:
     """
     if not admin_id:
         raise ValueError("admin_id 不能为空")
+    _validate_admin_id(admin_id)
     index = _read_index()
     target = next((a for a in index.admins if a.admin_id == admin_id), None)
     if target is None:

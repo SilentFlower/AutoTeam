@@ -103,8 +103,8 @@ def test_add_admin_alias_falls_back_to_email_local_part(tmp_registry):
 
 
 def test_add_admin_alias_falls_back_to_admin_id_when_no_email(tmp_registry):
-    admin = admin_registry.add_admin(admin_registry.Admin(admin_id="zz112233"))
-    assert admin.alias == "zz112233"
+    admin = admin_registry.add_admin(admin_registry.Admin(admin_id="ee112233"))
+    assert admin.alias == "ee112233"
 
 
 def test_get_admin_returns_none_for_missing_id(tmp_registry):
@@ -132,7 +132,7 @@ def test_set_active_admin_updates_last_active_at(tmp_registry):
 def test_set_active_admin_rejects_unknown_id(tmp_registry):
     admin_registry.add_admin(admin_registry.Admin(admin_id="", email="a@example.com"))
     with pytest.raises(ValueError, match="不存在"):
-        admin_registry.set_active_admin("nope0001")
+        admin_registry.set_active_admin("deadbeef")
 
 
 def test_remove_admin_reassigns_active(tmp_registry):
