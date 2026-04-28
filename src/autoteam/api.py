@@ -1117,6 +1117,45 @@ class TeamMemberRemoveParams(BaseModel):
     type: str
 
 
+class SwitchAdminParams(BaseModel):
+    """切换激活管理员请求体。"""
+
+    admin_id: str
+
+
+class AdminLoginStartParams(BaseModel):
+    """新增/重新登录管理员的 ``/api/admins/login/start`` 请求体。
+
+    :param email: 管理员邮箱。
+    :param target_admin_id: 为已存在的 admin 重新登录时填写其 admin_id；
+        为空表示走"创建新管理员"流程。
+    """
+
+    email: str
+    target_admin_id: str | None = None
+
+
+class AdminLoginPasswordParams(BaseModel):
+    """``/api/admins/login/password`` 请求体。"""
+
+    password: str
+    target_admin_id: str | None = None
+
+
+class AdminLoginCodeParams(BaseModel):
+    """``/api/admins/login/code`` 请求体。"""
+
+    code: str
+    target_admin_id: str | None = None
+
+
+class AdminLoginWorkspaceParams(BaseModel):
+    """``/api/admins/login/workspace`` 请求体。"""
+
+    option_id: str
+    target_admin_id: str | None = None
+
+
 def _normalized_email(value: str | None) -> str:
     return (value or "").strip().lower()
 
@@ -1617,6 +1656,345 @@ def post_admin_logout(admin_id: str | None = Depends(get_current_admin_id)):
         post_admin_login_cancel()
     clear_admin_state(admin_id)
     return {"message": "管理员登录态已清除", "admin": _admin_status(admin_id)}
+
+
+# ---------------------------------------------------------------------------
+# 多管理员管理 API（PR2）
+# ---------------------------------------------------------------------------
+
+
+def _serialize_admin(admin: admin_registry.Admin, *, active_id: str | None = None) -> dict:
+    """把 ``Admin`` dataclass 序列化为前端可消费的 dict（带 ``is_active`` 标记）。"""
+    payload = admin.to_dict()
+    payload["is_active"] = bool(active_id) and admin.admin_id == active_id
+    return payload
+
+
+def _resolve_target_admin_id(target: str | None) -> str | None:
+    """把 body 里的 ``target_admin_id`` 转成校验过的 admin_id。
+
+    - 为空 → 返回 ``None``（创建新 admin 流程）。
+    - 校验通过且存在 → 返回该 admin_id。
+    - 校验通过但不存在 → 抛 404；格式非法 → 由 ``_validate_admin_id`` 抛 400。
+    """
+    if not target:
+        return None
+    target = target.strip()
+    if not target:
+        return None
+    _validate_admin_id(target)
+    if not admin_registry.get_admin(target):
+        raise HTTPException(status_code=404, detail=f"管理员不存在: {target}")
+    return target
+
+
+@app.get("/api/admins")
+def get_admins():
+    """列出所有已注册的 admin（含别名、是否激活）。"""
+    active_id = admin_registry.get_active_admin_id()
+    return {
+        "admins": [_serialize_admin(a, active_id=active_id) for a in admin_registry.list_admins()],
+        "active_admin_id": active_id,
+    }
+
+
+@app.get("/api/admins/active")
+def get_active_admin():
+    """获取当前激活 admin（无任何 admin 时返回 ``{"admin": null}``）。"""
+    admin = admin_registry.get_active_admin()
+    if not admin:
+        return {"admin": None, "active_admin_id": None}
+    return {
+        "admin": _serialize_admin(admin, active_id=admin.admin_id),
+        "active_admin_id": admin.admin_id,
+    }
+
+
+@app.post("/api/admins/active")
+def post_switch_active_admin(params: SwitchAdminParams):
+    """切换激活 admin。
+
+    body: ``{"admin_id": "<8 hex>"}``。404 表示该 id 未注册；400 表示 id 格式非法。
+    """
+    target = (params.admin_id or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="admin_id 不能为空")
+    _validate_admin_id(target)
+    try:
+        admin = admin_registry.set_active_admin(target)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {
+        "admin": _serialize_admin(admin, active_id=admin.admin_id),
+        "active_admin_id": admin.admin_id,
+    }
+
+
+@app.delete("/api/admins/{admin_id}")
+def delete_admin(admin_id: str):
+    """删除一个 admin：移除索引项 + 删除其数据目录 + 清理远端 codex-main 主号文件。
+
+    禁止删除当前唯一的 admin（避免清空所有上下文）。返回 ``{deleted_admin_id, ...}``。
+    """
+    _validate_admin_id(admin_id)
+    target = admin_registry.get_admin(admin_id)
+    if not target:
+        raise HTTPException(status_code=404, detail=f"管理员不存在: {admin_id}")
+
+    all_admins = admin_registry.list_admins()
+    if len(all_admins) <= 1:
+        raise HTTPException(status_code=400, detail="禁止删除当前唯一的管理员，请先添加另一个管理员")
+
+    # 记录主号 codex-main 文件名（用于远端清理）
+    from autoteam.auth_storage import get_auth_dir
+
+    auth_files: list[str] = []
+    auth_dir = get_auth_dir(admin_id)
+    if auth_dir.exists():
+        auth_files = [p.name for p in auth_dir.glob("codex-main-*.json") if p.is_file()]
+
+    # 同步：取消远端 codex-main 关联（best-effort，失败不阻塞索引清理）
+    remote_cleanup: dict = {}
+    if auth_files:
+        try:
+            from autoteam.sync_targets import delete_account_from_configured_targets
+
+            remote_cleanup = delete_account_from_configured_targets(
+                target.email or admin_id,
+                auth_names=auth_files,
+                include_disabled=True,
+            )
+        except Exception as exc:
+            logger.warning("[Admin] 删除 admin %s 时清理远端失败（已忽略，继续删除本地）: %s", admin_id, exc)
+
+    # 移除索引（自动调整 active_admin_id）
+    admin_registry.remove_admin(admin_id)
+
+    # 删除本地数据目录
+    try:
+        from autoteam.admin_registry import admin_data_dir
+
+        data_dir = admin_data_dir(admin_id)
+        if data_dir.exists():
+            import shutil as _shutil
+
+            _shutil.rmtree(data_dir, ignore_errors=False)
+    except Exception as exc:
+        logger.error("[Admin] 删除 admin %s 数据目录失败: %s", admin_id, exc)
+
+    new_active = admin_registry.get_active_admin_id()
+    logger.info("[Admin] 已删除 admin: %s，新的激活 admin: %s", admin_id, new_active)
+    return {
+        "deleted_admin_id": admin_id,
+        "active_admin_id": new_active,
+        "remote_cleanup": remote_cleanup,
+    }
+
+
+def _prepare_admin_login_target(target_admin_id: str | None, email: str | None) -> str | None:
+    """根据请求体决定本次登录会话的目标 admin_id。
+
+    - 已存在的 admin → 返回其 id 并切到激活，让随后 ``update_admin_state`` 写到正确目录。
+    - 创建新 admin → 调用 ``add_admin`` 生成新 id，切为激活。
+    - 缺省（旧路由 fallback）→ 返回 ``None``。
+
+    :param target_admin_id: 客户端指定的 ``target_admin_id``，已 strip。
+    :param email: ``params.email``，仅在创建新 admin 时用作初始 ``email`` 字段。
+    """
+    if target_admin_id:
+        # 已存在的 admin 重新登录：切激活，登录流程的 update_admin_state 自然写入其目录。
+        admin = admin_registry.get_admin(target_admin_id)
+        if not admin:
+            raise HTTPException(status_code=404, detail=f"管理员不存在: {target_admin_id}")
+        admin_registry.set_active_admin(target_admin_id)
+        return target_admin_id
+
+    if email is None or not email.strip():
+        # 没有 target 也没有 email → 兼容老路由（active fallback）。
+        return None
+
+    # 创建新 admin：先在索引里登记一条空壳，让登录流程把 state 写到它的目录。
+    new_admin = admin_registry.add_admin(admin_registry.Admin(admin_id="", email=email.strip()))
+    admin_registry.set_active_admin(new_admin.admin_id)
+    logger.info("[Admin] 为新管理员预创建索引: %s (%s)", new_admin.admin_id, new_admin.email)
+    return new_admin.admin_id
+
+
+def _ensure_pending_target_matches(target_admin_id: str | None) -> None:
+    """检查当前在飞登录会话的目标 admin_id 是否与请求体一致。
+
+    若 body 指定了 ``target_admin_id`` 但与正在跑的会话不匹配，返回 409，避免
+    跨 admin 误用（例如同时两个浏览器抢登录）。
+    """
+    if not target_admin_id:
+        return
+    if not _admin_login_api:
+        raise HTTPException(status_code=409, detail="当前没有等待中的管理员登录流程")
+    if _admin_login_target and _admin_login_target != target_admin_id:
+        raise HTTPException(
+            status_code=409,
+            detail="当前在跑的管理员登录流程不属于该 admin，请先取消后再发起",
+        )
+
+
+@app.post("/api/admins/login/start")
+def post_admins_login_start(params: AdminLoginStartParams):
+    """启动登录流程：可为现有 admin 重新登录，或创建新 admin。
+
+    body: ``{"email": "...", "target_admin_id": "..."}``。``target_admin_id``
+    省略时表示创建新 admin。完成后激活即指向该 admin。
+    """
+    global _admin_login_api, _admin_login_target
+
+    target = _resolve_target_admin_id(params.target_admin_id)
+
+    if _admin_login_api:
+        try:
+            _pw_executor.run(_admin_login_api.stop)
+        except Exception:
+            pass
+        _clear_admin_login_session()
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再进行管理员登录")
+        )
+
+    try:
+        # 必须在 begin_admin_login 之前切到目标 admin，否则登录中途写 state 会写到错误目录。
+        target = _prepare_admin_login_target(target, params.email)
+
+        from autoteam.chatgpt_api import ChatGPTTeamAPI
+
+        logger.info("[API] 启动多 admin 登录: target=%s email=%s", target or "<active>", params.email.strip())
+
+        def _do_start(email):
+            return _run_playwright_start(
+                ChatGPTTeamAPI, lambda api, login_email: api.begin_admin_login(login_email), email
+            )
+
+        api, result = _pw_executor.run(_do_start, params.email.strip())
+        step = result["step"]
+        if step == "completed":
+            _admin_login_api = api
+            _admin_login_target = target or _PENDING_ADMIN_KEY
+            return _finish_admin_login(result)
+        if step in ("password_required", "code_required", "workspace_required"):
+            return _set_pending_admin_login(api, step, target_admin_id=target)
+        _pw_executor.run(api.stop)
+        _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=result.get("detail") or "无法识别管理员登录步骤")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[API] 多 admin 登录 start 失败")
+        if _playwright_lock.locked():
+            _playwright_lock.release()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/admins/login/password")
+def post_admins_login_password(params: AdminLoginPasswordParams):
+    """提交密码（``target_admin_id`` 用于校验当前在飞会话与请求一致）。"""
+    global _admin_login_step
+    target = _resolve_target_admin_id(params.target_admin_id)
+    _ensure_pending_target_matches(target)
+
+    if not _admin_login_api or _admin_login_step != "password_required":
+        raise HTTPException(status_code=409, detail="当前没有等待密码的管理员登录流程")
+
+    try:
+        result = _pw_executor.run(_admin_login_api.submit_admin_password, params.password)
+        step = result["step"]
+        if step == "completed":
+            return _finish_admin_login(result)
+        if step in ("password_required", "code_required", "workspace_required"):
+            _admin_login_step = step
+            return {"status": step, "admin": _admin_status()}
+        raise HTTPException(status_code=400, detail=result.get("detail") or "管理员密码登录失败")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[API] 多 admin 登录 password 失败")
+        try:
+            _pw_executor.run(_admin_login_api.stop)
+        except Exception:
+            pass
+        _clear_admin_login_session()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/admins/login/code")
+def post_admins_login_code(params: AdminLoginCodeParams):
+    """提交验证码。"""
+    global _admin_login_step
+    target = _resolve_target_admin_id(params.target_admin_id)
+    _ensure_pending_target_matches(target)
+
+    if not _admin_login_api or _admin_login_step != "code_required":
+        raise HTTPException(status_code=409, detail="当前没有等待验证码的管理员登录流程")
+
+    try:
+        result = _pw_executor.run(_admin_login_api.submit_admin_code, params.code.strip())
+        step = result["step"]
+        if step == "completed":
+            return _finish_admin_login(result)
+        if step in ("password_required", "code_required", "workspace_required"):
+            _admin_login_step = step
+            return {"status": step, "admin": _admin_status()}
+        raise HTTPException(status_code=400, detail=result.get("detail") or "管理员验证码登录失败")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[API] 多 admin 登录 code 失败")
+        try:
+            _pw_executor.run(_admin_login_api.stop)
+        except Exception:
+            pass
+        _clear_admin_login_session()
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/admins/login/workspace")
+def post_admins_login_workspace(params: AdminLoginWorkspaceParams):
+    """提交 workspace 选择（最后一步）。"""
+    global _admin_login_step
+    target = _resolve_target_admin_id(params.target_admin_id)
+    _ensure_pending_target_matches(target)
+
+    if not _admin_login_api or _admin_login_step != "workspace_required":
+        raise HTTPException(status_code=409, detail="当前没有等待组织选择的管理员登录流程")
+
+    try:
+        result = _pw_executor.run(_admin_login_api.select_workspace_option, params.option_id)
+        step = result["step"]
+        if step == "completed":
+            response = _finish_admin_login(result)
+            # 登录成功：把 info 里的最新 workspace_name/account_id 回写到 admins.json
+            info = response.get("info") or {}
+            target_id = target or admin_registry.get_active_admin_id()
+            if target_id and isinstance(info, dict):
+                admin_registry.update_admin(
+                    target_id,
+                    email=info.get("email") or None,
+                    workspace_name=info.get("workspace_name") or None,
+                    account_id=info.get("account_id") or None,
+                )
+            return response
+        if step in ("password_required", "code_required", "workspace_required"):
+            _admin_login_step = step
+            return {"status": step, "admin": _admin_status()}
+        raise HTTPException(status_code=400, detail=result.get("detail") or "管理员组织选择失败")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("[API] 多 admin 登录 workspace 失败")
+        try:
+            _pw_executor.run(_admin_login_api.stop)
+        except Exception:
+            pass
+        _clear_admin_login_session()
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/main-codex/start")
