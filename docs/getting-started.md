@@ -268,8 +268,6 @@ uv run autoteam pull-cpa    # 从 CPA 拉回本地
 uv run autoteam rotate 8   # 补满到 8 个总席位
 # 或
 uv run autoteam add        # 自动注册并添加一个
-# 或
-uv run autoteam manual-add # 手动 OAuth 导入一个账号
 ```
 
 ### 清理多余账号

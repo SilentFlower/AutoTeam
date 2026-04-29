@@ -99,7 +99,6 @@ http://localhost:1455/auth/callback
 | `cpa_sync.py` | CPA 双向同步与去重 |
 | `sub2api_sync.py` | Sub2API 同步与分组处理 |
 | `sync_targets.py` | 统一分发 CPA / Sub2API 同步目标 |
-| `manual_account.py` | 手动 OAuth 导入（自动 / 手动回调） |
 
 ## 项目结构
 
@@ -122,7 +121,6 @@ autoteam/
 │   ├── cpa_sync.py             # CPA 正反向同步
 │   ├── sub2api_sync.py         # Sub2API 同步与分组
 │   ├── sync_targets.py         # 统一远端同步目标
-│   ├── manual_account.py       # 手动 OAuth 导入
 │   ├── invite.py               # 自动注册流程
 │   └── web/dist/               # 前端构建产物
 └── web/src/components/         # Web 面板各页面与组件

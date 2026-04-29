@@ -112,28 +112,6 @@ X-Autoteam-Admin-Id: <8 位小写 hex admin_id>
 | POST | `/api/main-codex/code` | 提交验证码 |
 | POST | `/api/main-codex/cancel` | 取消同步 |
 
-## 手动 OAuth 导入
-
-后端先生成 Codex OAuth 链接，并尝试在 `localhost:1455` 自动接收回调；如果自动回调不可用，也可以手动提交回调 URL。
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/manual-account/status` | 当前手动 OAuth 状态 |
-| POST | `/api/manual-account/start` | 开始流程，返回 `auth_url` 与状态信息 |
-| POST | `/api/manual-account/callback` | 提交回调 URL |
-| POST | `/api/manual-account/cancel` | 取消流程 |
-
-### `/api/manual-account/status` 关键字段
-
-| 字段 | 说明 |
-|------|------|
-| `status` | `idle / pending_callback / completed / error` |
-| `auth_url` | 当前 OAuth 链接 |
-| `callback_received` | 是否已收到回调 |
-| `callback_source` | `auto` 或 `manual` |
-| `auto_callback_available` | 本地自动回调服务是否启动成功 |
-| `account` | 完成后导入的账号信息 |
-
 ## 调用示例
 
 ```bash
@@ -150,10 +128,6 @@ curl -X POST -H "Authorization: Bearer YOUR_KEY" \
 # 从 CPA 拉取认证文件到本地
 curl -X POST -H "Authorization: Bearer YOUR_KEY" \
   http://localhost:8787/api/sync/from-cpa
-
-# 生成手动 OAuth 链接
-curl -X POST -H "Authorization: Bearer YOUR_KEY" \
-  http://localhost:8787/api/manual-account/start
 ```
 
 ## 多管理员管理 (`/api/admins/*`)
