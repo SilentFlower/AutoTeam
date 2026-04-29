@@ -12,11 +12,36 @@ export function clearApiKey() {
   localStorage.removeItem('autoteam_api_key')
 }
 
+// admin_id 注入器：由 store/admins.js 在初始化时 setAdminIdGetter() 注册一个
+// 函数指针。这里用注册器模式而不是直接 import store，是为了避开
+// "api.js ↔ store/admins.js" 的循环依赖（store 内部要 import api）。
+let _adminIdGetter = () => null
+
+/**
+ * 注册 admin_id getter，请求拦截器据此往每次请求里注入
+ * `X-Autoteam-Admin-Id` header（getter 返回 null/空字符串时不注入，
+ * 让后端 fallback 到激活 admin，兼容旧客户端）。
+ * @param {() => (string|null)} getter
+ */
+export function setAdminIdGetter(getter) {
+  _adminIdGetter = typeof getter === 'function' ? getter : () => null
+}
+
 async function request(method, path, body = null) {
   const headers = { 'Content-Type': 'application/json' }
   const key = getApiKey()
   if (key) {
     headers['Authorization'] = `Bearer ${key}`
+  }
+  // 注入当前激活 admin_id；空值不注入，让后端走 active fallback。
+  let adminId = ''
+  try {
+    adminId = _adminIdGetter() || ''
+  } catch {
+    adminId = ''
+  }
+  if (adminId) {
+    headers['X-Autoteam-Admin-Id'] = adminId
   }
   const opts = { method, headers }
   if (body) opts.body = JSON.stringify(body)
@@ -67,6 +92,25 @@ export const api = {
   submitAdminWorkspace: (optionId) => request('POST', '/admin/login/workspace', { option_id: optionId }),
   cancelAdminLogin: () => request('POST', '/admin/login/cancel'),
   logoutAdmin: () => request('POST', '/admin/logout'),
+
+  // 多 admin（PR2 新增的 /api/admins/* 接口）
+  // 列表 / 切换 / 删除：
+  listAdmins: () => request('GET', '/admins'),
+  getActiveAdmin: () => request('GET', '/admins/active'),
+  setActiveAdmin: (adminId) => request('POST', '/admins/active', { admin_id: adminId }),
+  deleteAdmin: (adminId) => request('DELETE', `/admins/${encodeURIComponent(adminId)}`),
+  // 多 admin 登录流程：targetAdminId 省略 = 创建新 admin；非空 = 为现有 admin 重登。
+  startAdminLoginAsNew: (email) => request('POST', '/admins/login/start', { email }),
+  startAdminLoginForTarget: (email, targetAdminId) =>
+    request('POST', '/admins/login/start', { email, target_admin_id: targetAdminId }),
+  submitAdminLoginPasswordTarget: (password, targetAdminId = null) =>
+    request('POST', '/admins/login/password', targetAdminId ? { password, target_admin_id: targetAdminId } : { password }),
+  submitAdminLoginCodeTarget: (code, targetAdminId = null) =>
+    request('POST', '/admins/login/code', targetAdminId ? { code, target_admin_id: targetAdminId } : { code }),
+  submitAdminLoginWorkspaceTarget: (optionId, targetAdminId = null) =>
+    request('POST', '/admins/login/workspace', targetAdminId
+      ? { option_id: optionId, target_admin_id: targetAdminId }
+      : { option_id: optionId }),
   startMainCodexLogin: () => request('POST', '/main-codex/login'),
   startMainCodexSync: () => request('POST', '/main-codex/start'),
   submitMainCodexPassword: (password) => request('POST', '/main-codex/password', { password }),
