@@ -121,8 +121,9 @@
         </div>
 
       <!-- 页面内容 -->
-        <Dashboard v-if="currentPage === 'dashboard'"
-          :status="status" :loading="loading" :running-task="busyTask" :admin-status="adminStatus" @refresh="refresh" />
+        <Workbench v-if="currentPage === 'workbench'"
+          :status="status" :loading="loading" :running-task="busyTask" :admin-status="adminStatus"
+          @refresh="refresh" @task-started="onTaskStarted" />
 
         <ConfigPage
           v-else-if="currentPage === 'config'"
@@ -131,19 +132,6 @@
           @refresh="refresh"
           @admin-progress="onAdminProgress"
         />
-
-        <TeamMembers v-else-if="currentPage === 'team'" />
-
-        <PoolPage v-else-if="currentPage === 'pool'"
-          :running-task="busyTask" :admin-status="adminStatus"
-          @task-started="onTaskStarted" @refresh="refresh" />
-
-        <SyncPage v-else-if="currentPage === 'sync'"
-          :running-task="busyTask" :admin-status="adminStatus"
-          @task-started="onTaskStarted" @refresh="refresh" />
-
-        <OAuthPage v-else-if="currentPage === 'oauth'"
-          :manual-account-status="manualAccountStatus" @refresh="refresh" @progress="onAdminProgress" />
 
         <TaskHistoryPage v-else-if="currentPage === 'tasks'"
           :tasks="tasks" />
@@ -157,16 +145,15 @@
 <script setup>
 import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { api, setApiKey, clearApiKey } from './api.js'
+// 引入 store/admins.js 是为了让其顶层 IIFE 把 admin_id getter 注册到 api.js，
+// 让请求拦截器从应用启动起就能往每次请求注入 X-Autoteam-Admin-Id header。
+import './store/admins.js'
 import SetupPage from './components/SetupPage.vue'
 import Sidebar from './components/Sidebar.vue'
-import Dashboard from './components/Dashboard.vue'
+import Workbench from './components/Workbench.vue'
 import ConfigPage from './components/ConfigPage.vue'
-import TeamMembers from './components/TeamMembers.vue'
-import PoolPage from './components/PoolPage.vue'
-import SyncPage from './components/SyncPage.vue'
 import TaskHistoryPage from './components/TaskHistoryPage.vue'
 import LogViewer from './components/LogViewer.vue'
-import OAuthPage from './components/OAuthPage.vue'
 import ThemeToggle from './components/ThemeToggle.vue'
 import { initTheme } from './theme.js'
 
@@ -176,7 +163,7 @@ const authRequired = ref(false)
 const authLoading = ref(false)
 const authError = ref('')
 const inputKey = ref('')
-const currentPage = ref('dashboard')
+const currentPage = ref('workbench')
 
 const status = ref(null)
 const adminStatus = ref(null)
