@@ -13,6 +13,20 @@ Authorization: Bearer <API_KEY>
 - `/api/setup/status`
 - `/api/setup/save`
 
+## 多管理员上下文 Header
+
+支持登录多个 Team 管理员主号(详见 [架构文档](architecture.md))。多数读写账号池 / Team / Codex 等数据的接口可接收可选 Header:
+
+```text
+X-Autoteam-Admin-Id: <8 位小写 hex admin_id>
+```
+
+- 不传 → 后端 fallback 到当前激活 admin(由 `data/admins.json` 的 `active_admin_id` 决定)
+- 格式不正确 → 返回 400 `管理员标识格式不正确,请联系管理员重新登录`
+- admin_id 不存在 → 视具体接口语义,通常 fallback 到 active 或 404
+
+前端 `web/src/api.js` 拦截器自动注入,旧 CLI 客户端不传也兼容。
+
 ## 即时返回接口
 
 这些接口直接返回结果，不创建后台任务。
@@ -141,3 +155,48 @@ curl -X POST -H "Authorization: Bearer YOUR_KEY" \
 curl -X POST -H "Authorization: Bearer YOUR_KEY" \
   http://localhost:8787/api/manual-account/start
 ```
+
+## 多管理员管理 (`/api/admins/*`)
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/admins` | 列出所有 admin,返回 `{admins: [...], active_admin_id}` |
+| GET | `/api/admins/active` | 获取当前激活 admin |
+| POST | `/api/admins/active` | 切换激活 admin,body `{admin_id}` |
+| DELETE | `/api/admins/{admin_id}` | 删除指定 admin(凭据+数据目录),唯一 admin 时拒绝 400 |
+| POST | `/api/admins/login/start` | 启动登录流程,body 含可选 `target_admin_id`(不传=创建新 admin,传=为现有 admin 重登) + `email` |
+| POST | `/api/admins/login/password` | 提交密码,同上 body 字段 |
+| POST | `/api/admins/login/code` | 提交邮箱验证码,同上 |
+| POST | `/api/admins/login/workspace` | 选择 workspace,同上 |
+
+### 切换激活示例
+
+```bash
+# 列出所有 admin
+curl -H "Authorization: Bearer YOUR_KEY" \
+  http://localhost:8787/api/admins
+
+# 切到另一个 admin
+curl -X POST -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"admin_id": "ee112233"}' \
+  http://localhost:8787/api/admins/active
+```
+
+### 创建新 admin 流程
+
+```bash
+# 1. 启动登录(不传 target_admin_id 则创建新 admin)
+curl -X POST -H "Authorization: Bearer YOUR_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"email": "new@example.com"}' \
+  http://localhost:8787/api/admins/login/start
+
+# 2/3/4 ... 后续交互式步骤同 /api/admin/login/* 旧流程,
+#       区别是各步 body 可携带 target_admin_id 锁定目标
+```
+
+### 旧路由 `/api/admin/*` 兼容性
+
+旧的 `/api/admin/*` / `/api/accounts/*` / `/api/team/*` / `/api/sync/*` 等路由全部保留,内部已透传 `admin_id`(优先 header,缺省 active),不传 header 仍能跑通。新接入项目建议直接走 `/api/admins/*` + Header。
+

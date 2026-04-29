@@ -132,14 +132,39 @@ autoteam/
 
 当前 Web 面板已按职责拆分为：
 
-- 仪表盘
+- 工作台（仪表盘 / Team 成员 / 账号池 / 同步 4 tab 合并 + 顶部 admin 切换器 + 邀请加号主按钮）
 - 配置面板
-- Team 成员
-- 账号池操作
-- 同步中心
-- OAuth 登录
 - 任务历史
 - 日志
+
+## 多管理员主号
+
+AutoTeam 支持登录、管理多个 Team 管理员（"主号"），同一时刻只有一个**激活管理员**——用户操作（轮转 / 同步 / kick / 邀请加号 等）都作用于激活 admin 的账号池;后台巡检则**轮流**遍历所有 admin 各自跑一次,保证已登录但未激活的 admin 也得到守护。
+
+### 数据布局
+
+```
+data/
+├── admins.json                       # 索引(admins[] + active_admin_id)
+├── admins/
+│   ├── <admin_id_a>/                 # 每个 admin 一个工作区目录
+│   │   ├── state.json                # 凭据/email/workspace_name/account_id
+│   │   ├── accounts.json             # 该主号的子账号池
+│   │   └── auths/codex-main-*.json   # 主号 Codex 凭据
+│   └── <admin_id_b>/...
+└── legacy-backup/<timestamp>/        # 单 admin → 多 admin 自动迁移备份
+```
+
+`admin_id` 是 8 位小写 hex（来自 UUID4 截取),首次启动时若检测到旧 `state.json + accounts.json + auths/` 会自动迁移到新结构,原文件备份到 `legacy-backup/`。
+
+### 抽象层
+
+- `src/autoteam/admin_registry.py` —— admin 增删改查 / 激活切换 / 自动迁移
+- 数据层（`admin_state.py` / `accounts.py` / `auth_storage.py` / `codex_auth.py` / `account_ops.py`）所有读写函数接收可选 `admin_id` 参数,缺省 fallback 到 `get_active_admin_id()`
+
+### API 上下文传递
+
+HTTP 请求头 `X-Autoteam-Admin-Id: <8 位 hex>` 指定操作目标 admin;FastAPI 的 `Depends(get_current_admin_id)` 解析并白名单校验。前端 `web/src/api.js` 拦截器从 store 自动注入;旧客户端不传 header 时后端 fallback 到 active admin。
 
 ## 开发
 

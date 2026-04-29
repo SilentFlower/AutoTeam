@@ -292,6 +292,28 @@ uv run autoteam pull-cpa
 - 按本地命名规范重写到 `auths/`
 - 将新导入账号补进 `accounts.json`（默认标记为 `standby`）
 
+## 使用多管理员主号
+
+AutoTeam 支持登录多个 Team 管理员主号(详见 [架构文档](architecture.md))。同一时刻只有一个**激活管理员**——你在工作台看到的所有数据 / 触发的所有操作都作用于它,后台巡检会**轮流**照顾全部已登录 admin 的账号池。
+
+### 添加第二个管理员
+
+1. 在工作台顶部点击当前 admin 名右侧的下拉,选「+ 添加新管理员」
+2. 完成邮箱→密码→验证码→workspace 选择流程(同首次登录)
+3. 登录成功后新 admin 自动设为激活,工作台 4 tab 切换到该 admin 的数据
+
+### 切换激活管理员
+
+工作台顶部下拉里点击其他 admin 即可。所有 tab(仪表盘 / Team / 账号池 / 同步)会自动重新拉数据。
+
+### 删除管理员
+
+下拉里悬浮目标 admin 行,右侧出现 🗑 删除按钮——点击会弹原生确认框,确定后清空该 admin 的 `data/admins/{id}/` 凭据 + 账号池数据(不可恢复)。系统中只剩一个 admin 时禁止删除,请先添加另一个或登录新账号。
+
+### 升级:从单 admin 部署迁移
+
+旧版本的 `state.json + accounts.json + auths/` 在新版本首次启动时会自动迁移到 `data/admins/<admin_id>/` 子目录,原文件备份到 `data/legacy-backup/<timestamp>/`。无需手工干预,但如果你 mount 了 `state.json` 单文件到 Docker,需要改成 mount `data/` 目录(详见 [Docker 文档](docker.md))。
+
 ## 下一步
 
 - [配置详解](configuration.md)
