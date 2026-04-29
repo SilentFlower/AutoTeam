@@ -1820,6 +1820,38 @@ def _prepare_admin_login_target(target_admin_id: str | None, email: str | None) 
     return new_admin.admin_id
 
 
+def _rollback_pending_admin(admin_id: str | None) -> None:
+    """登录失败时回滚预创建的空壳 admin，避免锁死用户。
+
+    场景：``_prepare_admin_login_target`` 在登录开始前就 ``add_admin`` +
+    ``set_active_admin`` 写了一条空壳记录；若后续 ``begin_admin_login`` /
+    密码 / 验证码 / workspace 任意一步抛异常，必须把空壳清掉，否则当系统中
+    仅剩这一条空壳时，DELETE 路由会拒绝（"唯一 admin"），用户死锁。
+
+    判定空壳的依据：``workspace_name`` 与 ``account_id`` 都为空——只有走完
+    ``complete_admin_login`` 才会回填这两个字段。
+
+    :param admin_id: 待回滚的 admin_id；为占位符（``_PENDING_ADMIN_KEY``）或
+        ``None`` 时不动作。
+    """
+    if not admin_id or admin_id == _PENDING_ADMIN_KEY:
+        return
+    try:
+        admin = admin_registry.get_admin(admin_id)
+    except Exception:
+        return
+    if admin is None:
+        return
+    # 已经走完登录的 admin 有 workspace_name 或 account_id；不能误删。
+    if admin.workspace_name or admin.account_id:
+        return
+    try:
+        admin_registry.remove_admin(admin_id)
+        logger.info("[Admin] 登录失败回滚空壳 admin: %s", admin_id)
+    except Exception as exc:
+        logger.warning("[Admin] 回滚空壳 admin 失败: %s (%s)", admin_id, exc)
+
+
 def _ensure_pending_target_matches(target_admin_id: str | None) -> None:
     """检查当前在飞登录会话的目标 admin_id 是否与请求体一致。
 
@@ -1883,6 +1915,8 @@ def post_admins_login_start(params: AdminLoginStartParams):
             return _set_pending_admin_login(api, step, target_admin_id=target)
         _pw_executor.run(api.stop)
         _playwright_lock.release()
+        # 步骤无法识别也算登录失败：回滚预创建的空壳 admin。
+        _rollback_pending_admin(target)
         raise HTTPException(status_code=400, detail=result.get("detail") or "无法识别管理员登录步骤")
     except HTTPException:
         raise
@@ -1890,6 +1924,8 @@ def post_admins_login_start(params: AdminLoginStartParams):
         logger.exception("[API] 多 admin 登录 start 失败")
         if _playwright_lock.locked():
             _playwright_lock.release()
+        # begin_admin_login 抛异常时清理预创建的空壳，避免用户被锁死。
+        _rollback_pending_admin(target)
         raise HTTPException(status_code=400, detail=str(exc))
 
 
@@ -1911,6 +1947,8 @@ def post_admins_login_password(params: AdminLoginPasswordParams):
         if step in ("password_required", "code_required", "workspace_required"):
             _admin_login_step = step
             return {"status": step, "admin": _admin_status()}
+        # 无法识别的 step：登录已失败，回滚空壳后再抛 400。
+        _rollback_pending_admin(_admin_login_target)
         raise HTTPException(status_code=400, detail=result.get("detail") or "管理员密码登录失败")
     except HTTPException:
         raise
@@ -1920,6 +1958,8 @@ def post_admins_login_password(params: AdminLoginPasswordParams):
             _pw_executor.run(_admin_login_api.stop)
         except Exception:
             pass
+        # 先回滚空壳 admin（依赖 _admin_login_target），再清会话变量。
+        _rollback_pending_admin(_admin_login_target)
         _clear_admin_login_session()
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -1942,6 +1982,8 @@ def post_admins_login_code(params: AdminLoginCodeParams):
         if step in ("password_required", "code_required", "workspace_required"):
             _admin_login_step = step
             return {"status": step, "admin": _admin_status()}
+        # 无法识别的 step：登录已失败，回滚空壳后再抛 400。
+        _rollback_pending_admin(_admin_login_target)
         raise HTTPException(status_code=400, detail=result.get("detail") or "管理员验证码登录失败")
     except HTTPException:
         raise
@@ -1951,6 +1993,8 @@ def post_admins_login_code(params: AdminLoginCodeParams):
             _pw_executor.run(_admin_login_api.stop)
         except Exception:
             pass
+        # 先回滚空壳 admin（依赖 _admin_login_target），再清会话变量。
+        _rollback_pending_admin(_admin_login_target)
         _clear_admin_login_session()
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -1984,6 +2028,8 @@ def post_admins_login_workspace(params: AdminLoginWorkspaceParams):
         if step in ("password_required", "code_required", "workspace_required"):
             _admin_login_step = step
             return {"status": step, "admin": _admin_status()}
+        # 无法识别的 step：登录已失败，回滚空壳后再抛 400。
+        _rollback_pending_admin(_admin_login_target)
         raise HTTPException(status_code=400, detail=result.get("detail") or "管理员组织选择失败")
     except HTTPException:
         raise
@@ -1993,6 +2039,8 @@ def post_admins_login_workspace(params: AdminLoginWorkspaceParams):
             _pw_executor.run(_admin_login_api.stop)
         except Exception:
             pass
+        # 先回滚空壳 admin（依赖 _admin_login_target），再清会话变量。
+        _rollback_pending_admin(_admin_login_target)
         _clear_admin_login_session()
         raise HTTPException(status_code=400, detail=str(exc))
 

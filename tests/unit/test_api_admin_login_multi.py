@@ -147,3 +147,116 @@ def test_password_request_with_mismatched_target_returns_409(isolated_registry, 
     with pytest.raises(HTTPException) as exc:
         api.post_admins_login_password(api.AdminLoginPasswordParams(password="x", target_admin_id="bbbbbbbb"))
     assert exc.value.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# 登录失败回滚空壳 admin（修复 issue #2：避免唯一空壳锁死用户）。
+# ---------------------------------------------------------------------------
+
+
+class _FailingAtPasswordEngine:
+    """伪登录引擎：start 进入 password_required，submit_admin_password 抛异常。"""
+
+    workspace_options_cache: list = []
+
+    def begin_admin_login(self, email: str):
+        self.email = email
+        return {"step": "password_required", "detail": ""}
+
+    def submit_admin_password(self, password: str):
+        raise RuntimeError("密码错误")
+
+    def stop(self):
+        pass
+
+
+class _FailingAtWorkspaceEngine:
+    """伪登录引擎：start 直接进入 workspace_required，select_workspace_option 抛异常。"""
+
+    workspace_options_cache: list = []
+
+    def begin_admin_login(self, email: str):
+        self.email = email
+        return {"step": "workspace_required", "detail": ""}
+
+    def select_workspace_option(self, option_id: str):
+        raise RuntimeError("workspace 不存在")
+
+    def stop(self):
+        pass
+
+
+def test_login_password_failure_rollbacks_pending_admin(isolated_registry, monkeypatch):
+    """新 admin 注册过程中密码失败 → 空壳应被自动清理，DELETE 不再因唯一 admin 拒绝。
+
+    回归 issue #2：原实现先 add_admin + set_active 再 begin_admin_login，密码错时
+    没回滚，空壳残留，仅剩这一条时 DELETE 拒绝（"唯一 admin"），用户死锁。
+    """
+    monkeypatch.setattr(api._pw_executor, "run", lambda func, *args, **kwargs: func(*args, **kwargs))
+    monkeypatch.setattr(api, "_playwright_lock", threading.Lock())
+    monkeypatch.setattr(
+        "autoteam.chatgpt_api.ChatGPTTeamAPI",
+        lambda: _FailingAtPasswordEngine(),
+    )
+    monkeypatch.setattr(
+        "autoteam.admin_state.get_admin_state_summary",
+        lambda admin_id=None: {
+            "configured": False,
+            "email": "",
+            "password_saved": False,
+            "session_present": False,
+            "account_id": "",
+            "workspace_name": "",
+            "updated_at": None,
+        },
+    )
+
+    # 第 1 步：start → 创建空壳，进入 password_required。
+    api.post_admins_login_start(api.AdminLoginStartParams(email="new@example.com"))
+    assert len(admin_registry.list_admins()) == 1
+    new_id = admin_registry.list_admins()[0].admin_id
+
+    # 第 2 步：提交密码失败。
+    with pytest.raises(HTTPException) as exc:
+        api.post_admins_login_password(api.AdminLoginPasswordParams(password="wrong", target_admin_id=new_id))
+    assert exc.value.status_code == 400
+
+    # 关键：空壳应被回滚清理，admins.json 重新为空。
+    assert admin_registry.list_admins() == []
+    api._clear_admin_login_session()
+
+
+def test_login_workspace_failure_rollbacks_pending_admin(isolated_registry, monkeypatch):
+    """workspace 选择失败也要回滚空壳 admin，避免锁死。"""
+    monkeypatch.setattr(api._pw_executor, "run", lambda func, *args, **kwargs: func(*args, **kwargs))
+    monkeypatch.setattr(api, "_playwright_lock", threading.Lock())
+    monkeypatch.setattr(
+        "autoteam.chatgpt_api.ChatGPTTeamAPI",
+        lambda: _FailingAtWorkspaceEngine(),
+    )
+    monkeypatch.setattr(
+        "autoteam.admin_state.get_admin_state_summary",
+        lambda admin_id=None: {
+            "configured": False,
+            "email": "",
+            "password_saved": False,
+            "session_present": False,
+            "account_id": "",
+            "workspace_name": "",
+            "updated_at": None,
+        },
+    )
+
+    # 第 1 步：start → 创建空壳，进入 workspace_required。
+    api.post_admins_login_start(api.AdminLoginStartParams(email="new@example.com"))
+    assert len(admin_registry.list_admins()) == 1
+    new_id = admin_registry.list_admins()[0].admin_id
+
+    # 第 2 步：提交 workspace 失败。
+    with pytest.raises(HTTPException) as exc:
+        api.post_admins_login_workspace(api.AdminLoginWorkspaceParams(option_id="not-exist", target_admin_id=new_id))
+    assert exc.value.status_code == 400
+
+    # 空壳应被回滚清理。
+    assert admin_registry.list_admins() == []
+    api._clear_admin_login_session()
