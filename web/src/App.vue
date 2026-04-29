@@ -125,6 +125,11 @@
           :status="status" :loading="loading" :running-task="busyTask" :admin-status="adminStatus"
           @refresh="refresh" @task-started="onTaskStarted" />
 
+        <FreePage
+          v-else-if="currentPage === 'free'"
+          :running-task="busyTask"
+        />
+
         <ConfigPage
           v-else-if="currentPage === 'config'"
           :admin-status="adminStatus"
@@ -152,6 +157,7 @@ import SetupPage from './components/SetupPage.vue'
 import Sidebar from './components/Sidebar.vue'
 import Workbench from './components/Workbench.vue'
 import ConfigPage from './components/ConfigPage.vue'
+import FreePage from './components/FreePage.vue'
 import TaskHistoryPage from './components/TaskHistoryPage.vue'
 import LogViewer from './components/LogViewer.vue'
 import ThemeToggle from './components/ThemeToggle.vue'

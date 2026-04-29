@@ -168,4 +168,23 @@ export const api = {
   getTeamMembers: () => request('GET', '/team/members'),
   removeTeamMember: (payload) => request('POST', '/team/members/remove', payload),
   getLogs: (limit = 100, since = 0) => request('GET', `/logs?limit=${limit}&since=${since}`),
+
+  // 免费号(FREE)池：与 active 池完全隔离的"已注册可登录、不占 Team 席位"账号资产。
+  // 后端实现见 src/autoteam/free_accounts.py + /api/free/* 端点；
+  // 前端入口在 FreePage.vue（侧栏导航键 'free'）。
+  free: {
+    // POST /api/free/generate {count} → 202 + task_id；任务后台跑 cmd_generate_free_account
+    generate: (count = 1) => request('POST', '/free/generate', { count }),
+    // GET /api/free/list → 当前 admin 的 FREE 池全部记录
+    // 注意：响应包含明文 password（PRD 要求"复制 email+password"按钮，已经过 API Key 鉴权）；
+    // 前端切勿把 password 写日志或截图。
+    list: () => request('GET', '/free/list'),
+    // POST /api/free/check_quota {emails: [...] | null} → 202 + task_id
+    // emails=null 表示刷新全部 active/exhausted；非空数组表示仅刷新指定邮箱
+    checkQuota: (emails = null) => request('POST', '/free/check_quota', { emails }),
+    // POST /api/free/sync_sub2api → 同步执行的"FREE → sub2api"手动触发兜底
+    syncSub2api: () => request('POST', '/free/sync_sub2api'),
+    // DELETE /api/free/{email} → 级联删除（auth_file + sub2api + cloudmail + JSON 条目）
+    delete: (email) => request('DELETE', `/free/${encodeURIComponent(email)}`),
+  },
 }

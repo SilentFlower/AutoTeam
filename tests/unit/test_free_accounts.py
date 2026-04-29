@@ -1,15 +1,18 @@
 """免费号池单元测试。
 
-覆盖 PR1 范围:
+覆盖范围:
 
-- 数据层 CRUD: load / save / find / add / update / delete 的边界与异常路径;
-- 业务命令 ``cmd_generate_free_account``: Step A 失败、Step B 失败、全成功三条主路径;
-- 内部辅助 ``_verify_team_removal``: 首次确认成功 / 两次都失败两种情况;
-- ``check_free_quota``: 不读 active 状态外的免费号、auth_file 缺失的处理;
-- ``delete_free_account``: 仅本地清理,远端清理标志不生效。
+- 数据层 CRUD: load / save / find / add / update / delete 的边界与异常路径(PR1);
+- 业务命令 ``cmd_generate_free_account``: Step A 失败、Step B 失败、全成功三条主路径(PR1);
+- 内部辅助 ``_verify_team_removal``: 首次确认成功 / 两次都失败两种情况(PR1);
+- ``check_free_quota``: 不读 active 状态外的免费号、auth_file 缺失的处理(PR1);
+- ``delete_free_account``:
+  * ``cleanup_remote=False`` 仅本地清理(PR1 兼容路径);
+  * ``cleanup_remote=True`` 完整 F3 级联(本地 auth_file + sub2api + cloudmail + JSON 条目)(PR3);
+  * 单步失败不阻塞:auth_file unlink / sub2api / cloudmail 任一抛错都不影响其他步骤(PR3)。
 
-外部依赖(``manager`` / ``codex_auth`` / ``mail_provider`` / ``chatgpt_api``)全部走
-``monkeypatch.setattr`` 注入伪实现,不触碰真实 HTTP / 文件系统。
+外部依赖(``manager`` / ``codex_auth`` / ``mail_provider`` / ``chatgpt_api`` /
+``sub2api_sync``)全部走 ``monkeypatch.setattr`` 注入伪实现,不触碰真实 HTTP / 文件系统。
 """
 
 from __future__ import annotations
@@ -488,19 +491,22 @@ def test_check_free_quota_reports_not_found_for_unknown_email(free_file):
 
 
 # ---------------------------------------------------------------------------
-# delete_free_account: 仅本地清理
+# delete_free_account: 本地清理(cleanup_remote=False) + 级联清理(cleanup_remote=True)
 # ---------------------------------------------------------------------------
 
 
 def test_delete_free_account_removes_local_auth_file_and_record(tmp_path, free_file):
+    """``cleanup_remote=False`` 路径:仅删 auth_file + JSON 条目,不触达任何远端。"""
     auth_path = tmp_path / "codex-del@example.com-team.json"
     auth_path.write_text("{}", encoding="utf-8")
 
     free_accounts.add_free(_make_record(email="del@example.com", auth_file=str(auth_path)))
 
-    cleanup = free_accounts.delete_free_account("del@example.com")
+    cleanup = free_accounts.delete_free_account("del@example.com", cleanup_remote=False)
     assert cleanup["local_record"] is True
     assert auth_path.name in cleanup["local_auth_files"]
+    assert cleanup["sub2api_accounts"] == []
+    assert cleanup["cloudmail_deleted"] is False
     assert not auth_path.exists()
     assert free_accounts.load_free() == []
 
@@ -509,13 +515,13 @@ def test_delete_free_account_handles_missing_auth_file(tmp_path, free_file):
     """auth_file 字段指向不存在的路径 → 不抛,只删 JSON 条目。"""
     free_accounts.add_free(_make_record(email="lost@example.com", auth_file=str(tmp_path / "missing.json")))
 
-    cleanup = free_accounts.delete_free_account("lost@example.com")
+    cleanup = free_accounts.delete_free_account("lost@example.com", cleanup_remote=False)
     assert cleanup["local_record"] is True
     assert cleanup["local_auth_files"] == []  # 文件不存在 → 不计入摘要
 
 
 def test_delete_free_account_returns_empty_summary_when_not_found(free_file):
-    cleanup = free_accounts.delete_free_account("nope@example.com")
+    cleanup = free_accounts.delete_free_account("nope@example.com", cleanup_remote=False)
     assert cleanup == {
         "local_record": False,
         "local_auth_files": [],
@@ -524,19 +530,210 @@ def test_delete_free_account_returns_empty_summary_when_not_found(free_file):
     }
 
 
-def test_delete_free_account_cleanup_remote_flag_does_nothing_in_pr1(tmp_path, free_file, monkeypatch, caplog):
-    """PR1 边界:cleanup_remote=True 当前应仅写 info 日志,不实际清理远端。"""
-    auth_path = tmp_path / "codex-pr1@example.com.json"
+def test_delete_free_account_cascade_calls_sub2api_and_cloudmail(tmp_path, free_file, monkeypatch):
+    """PR3 完整级联:auth_file + sub2api 远端 + cloudmail 邮箱 + JSON 条目都被处理。"""
+    auth_path = tmp_path / "codex-cascade@example.com.json"
     auth_path.write_text("{}", encoding="utf-8")
-    free_accounts.add_free(_make_record(email="pr1@example.com", auth_file=str(auth_path)))
 
-    cleanup = free_accounts.delete_free_account("pr1@example.com", cleanup_remote=True)
+    free_accounts.add_free(
+        _make_record(
+            email="cascade@example.com",
+            auth_file=str(auth_path),
+            mail_provider="cloudmail",
+            mail_account_id=77,
+        )
+    )
 
-    # 远端清理字段保持 PR1 默认值
+    sub2api_calls: list[dict] = []
+
+    def _stub_sub2api(email, *, auth_names=None):
+        sub2api_calls.append({"email": email, "auth_names": list(auth_names or [])})
+        return {"deleted": [f"sub2api-{auth_path.name}"], "count": 1}
+
+    monkeypatch.setattr("autoteam.sub2api_sync.delete_account_from_sub2api", _stub_sub2api)
+
+    mail_calls: list[int] = []
+
+    class _StubMailClient:
+        provider_name = "cloudmail"
+
+        def login(self):
+            mail_calls.append(-1)
+
+        def delete_account(self, account_id):
+            mail_calls.append(account_id)
+            return {"code": 200}
+
+    monkeypatch.setattr("autoteam.mail_provider.get_mail_client", lambda *_a, **_k: _StubMailClient())
+
+    cleanup = free_accounts.delete_free_account("cascade@example.com")
+
+    # 本地 auth_file
+    assert cleanup["local_record"] is True
+    assert auth_path.name in cleanup["local_auth_files"]
+    assert not auth_path.exists()
+    # sub2api 远端
+    assert cleanup["sub2api_accounts"] == [f"sub2api-{auth_path.name}"]
+    assert sub2api_calls == [{"email": "cascade@example.com", "auth_names": [auth_path.name]}]
+    # cloudmail
+    assert cleanup["cloudmail_deleted"] is True
+    assert 77 in mail_calls
+    # JSON 条目
+    assert free_accounts.load_free() == []
+
+
+def test_delete_free_account_cascade_continues_when_sub2api_fails(tmp_path, free_file, monkeypatch):
+    """sub2api 删除抛错 → 不阻塞本地 / cloudmail / JSON 条目的清理(PRD F3 单步独立)。"""
+    auth_path = tmp_path / "codex-isolate@example.com.json"
+    auth_path.write_text("{}", encoding="utf-8")
+
+    free_accounts.add_free(
+        _make_record(
+            email="isolate@example.com",
+            auth_file=str(auth_path),
+            mail_account_id=99,
+        )
+    )
+
+    def _raise(*_a, **_k):
+        raise RuntimeError("sub2api down")
+
+    monkeypatch.setattr("autoteam.sub2api_sync.delete_account_from_sub2api", _raise)
+
+    class _OkMail:
+        provider_name = "cloudmail"
+
+        def login(self):
+            pass
+
+        def delete_account(self, _id):
+            return {"code": 200}
+
+    monkeypatch.setattr("autoteam.mail_provider.get_mail_client", lambda *_a, **_k: _OkMail())
+
+    cleanup = free_accounts.delete_free_account("isolate@example.com")
+
+    # sub2api 失败但其他步骤正常
+    assert cleanup["sub2api_accounts"] == []
+    assert cleanup["local_record"] is True
+    assert auth_path.name in cleanup["local_auth_files"]
+    assert cleanup["cloudmail_deleted"] is True
+    assert free_accounts.load_free() == []
+
+
+def test_delete_free_account_cascade_continues_when_cloudmail_fails(tmp_path, free_file, monkeypatch):
+    """cloudmail 删除抛错 → sub2api 仍能完成,JSON 条目仍被删。"""
+    auth_path = tmp_path / "codex-mailfail@example.com.json"
+    auth_path.write_text("{}", encoding="utf-8")
+
+    free_accounts.add_free(
+        _make_record(
+            email="mailfail@example.com",
+            auth_file=str(auth_path),
+            mail_account_id=11,
+        )
+    )
+
+    monkeypatch.setattr(
+        "autoteam.sub2api_sync.delete_account_from_sub2api",
+        lambda *_a, **_k: {"deleted": ["x"], "count": 1},
+    )
+
+    class _BoomMail:
+        provider_name = "cloudmail"
+
+        def login(self):
+            pass
+
+        def delete_account(self, _id):
+            raise RuntimeError("mail provider 5xx")
+
+    monkeypatch.setattr("autoteam.mail_provider.get_mail_client", lambda *_a, **_k: _BoomMail())
+
+    cleanup = free_accounts.delete_free_account("mailfail@example.com")
+
+    assert cleanup["cloudmail_deleted"] is False
+    # 其余步骤照旧
+    assert cleanup["sub2api_accounts"] == ["x"]
+    assert cleanup["local_record"] is True
+    assert free_accounts.load_free() == []
+
+
+def test_delete_free_account_cascade_continues_when_auth_unlink_fails(tmp_path, free_file, monkeypatch):
+    """删 auth_file 抛错 → sub2api / cloudmail / JSON 条目仍按原计划处理。"""
+    auth_path = tmp_path / "codex-rofs@example.com.json"
+    auth_path.write_text("{}", encoding="utf-8")
+
+    free_accounts.add_free(
+        _make_record(
+            email="rofs@example.com",
+            auth_file=str(auth_path),
+            mail_account_id=22,
+        )
+    )
+
+    # 把 Path.unlink 替换成抛错(模拟权限不够 / 卷只读)
+    real_unlink = type(auth_path).unlink
+
+    def _raise(self, *args, **kwargs):
+        if str(self) == str(auth_path):
+            raise PermissionError("readonly fs")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr("pathlib.Path.unlink", _raise)
+    monkeypatch.setattr(
+        "autoteam.sub2api_sync.delete_account_from_sub2api",
+        lambda *_a, **_k: {"deleted": ["a"], "count": 1},
+    )
+
+    class _OkMail:
+        provider_name = "cloudmail"
+
+        def login(self):
+            pass
+
+        def delete_account(self, _id):
+            return {"code": 200}
+
+    monkeypatch.setattr("autoteam.mail_provider.get_mail_client", lambda *_a, **_k: _OkMail())
+
+    cleanup = free_accounts.delete_free_account("rofs@example.com")
+
+    # auth_file 删除失败 → 不计入摘要,但其他步骤仍执行
+    assert cleanup["local_auth_files"] == []
+    assert cleanup["sub2api_accounts"] == ["a"]
+    assert cleanup["cloudmail_deleted"] is True
+    assert cleanup["local_record"] is True
+
+
+def test_delete_free_account_cleanup_remote_false_skips_sub2api_and_cloudmail(tmp_path, free_file, monkeypatch):
+    """``cleanup_remote=False`` 不应触达任何远端服务(回归保险:PR1 行为不破)。"""
+    auth_path = tmp_path / "codex-local@example.com.json"
+    auth_path.write_text("{}", encoding="utf-8")
+    free_accounts.add_free(
+        _make_record(
+            email="local@example.com",
+            auth_file=str(auth_path),
+            mail_account_id=33,
+        )
+    )
+
+    def _fail(*_a, **_k):
+        raise AssertionError("cleanup_remote=False 不应调 sub2api 删除")
+
+    monkeypatch.setattr("autoteam.sub2api_sync.delete_account_from_sub2api", _fail)
+    monkeypatch.setattr(
+        "autoteam.mail_provider.get_mail_client",
+        lambda *_a, **_k: pytest.fail("cleanup_remote=False 不应调 cloudmail"),
+    )
+
+    cleanup = free_accounts.delete_free_account("local@example.com", cleanup_remote=False)
+
     assert cleanup["sub2api_accounts"] == []
     assert cleanup["cloudmail_deleted"] is False
-    # 本地仍按原计划清理
+    # 本地清理仍然执行
     assert cleanup["local_record"] is True
+    assert auth_path.name in cleanup["local_auth_files"]
     assert not auth_path.exists()
 
 

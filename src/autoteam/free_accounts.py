@@ -38,6 +38,10 @@ team_residue 表达"是否需要用户手动清理 Team 残留"——两者正�
 - 数据层: ``load_free / save_free / find_free / add_free / update_free / delete_free``
 - 业务命令: ``cmd_generate_free_account / check_free_quota / delete_free_account``
 - 内部辅助: ``_verify_team_removal``(PRD F2 二次确认)
+
+PR3 在 ``delete_free_account`` 中接入完整 F3 级联清理(本地 auth_file + sub2api 远端
++ cloudmail 邮箱 + JSON 条目),每步独立 try/except,单步失败不阻塞其他步骤。
+``cleanup_remote=False`` 仍保留"仅本地清理"的语义供测试/特殊调用方使用。
 """
 
 from __future__ import annotations
@@ -657,7 +661,7 @@ def check_free_quota(emails: list[str] | None = None, admin_id: str | None = Non
 
 
 # ---------------------------------------------------------------------------
-# 删除(PR1 仅本地;远端清理留 PR3 完整级联)
+# 删除(PR3 完整级联:本地 auth_file + sub2api 远端 + cloudmail 邮箱 + JSON 条目)
 # ---------------------------------------------------------------------------
 
 
@@ -665,18 +669,23 @@ def delete_free_account(
     email: str,
     *,
     admin_id: str | None = None,
-    cleanup_remote: bool = False,
+    cleanup_remote: bool = True,
 ) -> dict[str, Any]:
-    """删除一条免费号(PR1 范围:仅本地 auth_file + json 条目)。
+    """删除一条免费号并按 PRD F3 级联清理远端资源。
 
-    PRD F3 完整级联清理(sub2api 远端 + cloudmail 邮箱)依赖 PR2 的 sub2api 参数化,
-    在 PR3 实现 ``/api/free/{email}`` 端点时一起接入。这里先把签名预留好,
-    并返回与未来一致的 cleanup 摘要结构,避免 PR3 改函数签名造成回归。
+    PRD F3 锁定的清理流程(每步独立 try/except,单步失败不阻塞其他):
+
+    1. 本地 ``auth_file``(``rec.auth_file`` 指向的 JSON);
+    2. sub2api 远端账号(借 :func:`sub2api_sync.delete_account_from_sub2api`);
+    3. cloudmail 临时邮箱(用 ``rec.mail_provider`` + ``rec.mail_account_id``);
+    4. ``free_accounts.json`` 条目本身。
 
     :param email: 目标邮箱(大小写不敏感)。
-    :param cleanup_remote: 占位参数;PR1 内固定按 False 处理(传 True 也只会做本地清理,
-        并在日志中提示功能尚未上线)。
-    :return: cleanup 摘要 dict,字段固定,缺失能力的字段保持 False/空列表。
+    :param admin_id: 目标 admin;缺省回退激活 admin。
+    :param cleanup_remote: True(默认)= 走完整 F3 级联;False = 仅做本地清理
+        (auth_file + JSON 条目),保留给 PR1 单元测试与希望"先本地、再补远端"的调用方。
+    :return: cleanup 摘要 dict,字段固定:
+        ``{local_record, local_auth_files, sub2api_accounts, cloudmail_deleted}``
     """
     cleanup: dict[str, Any] = {
         "local_record": False,
@@ -685,17 +694,14 @@ def delete_free_account(
         "cloudmail_deleted": False,
     }
 
-    if cleanup_remote:
-        # PR1 边界:不实现远端清理,但允许调用方传 True 不报错(PR3 接入后转为真实级联)
-        logger.info("[免费号] cleanup_remote=True 暂不生效(PR3 级联清理未上线): %s", email)
-
     records = load_free(admin_id)
     rec = find_free(records, email)
     if rec is None:
         logger.info("[免费号] 删除时未找到本地记录: %s", email)
         return cleanup
 
-    # ---- 删 auth_file
+    # ---- 步骤 1: 删本地 auth_file
+    # 单步失败不阻塞:写 warn 日志后继续后续步骤
     auth_file = rec.get("auth_file")
     if auth_file:
         path = Path(auth_file)
@@ -705,10 +711,58 @@ def delete_free_account(
                 cleanup["local_auth_files"].append(path.name)
                 logger.info("[免费号] 已删除 auth_file: %s", path.name)
         except Exception as exc:
-            # 单步失败不阻塞:写日志后继续删 JSON 条目
             logger.warning("[免费号] 删除 auth_file 失败: %s (%s)", auth_file, exc)
 
-    # ---- 删 JSON 条目
+    # ---- 步骤 2: 删 sub2api 远端账号(仅 cleanup_remote=True)
+    # 复用 sub2api_sync.delete_account_from_sub2api,FREE 号在 sub2api 侧用 _KIND_POOL
+    # 标记(与 active 池共用 group),所以同一个删除函数能命中。
+    if cleanup_remote:
+        try:
+            from autoteam.sub2api_sync import delete_account_from_sub2api
+
+            auth_names = list(cleanup["local_auth_files"])
+            result = delete_account_from_sub2api(email, auth_names=auth_names)
+            cleanup["sub2api_accounts"] = list((result or {}).get("deleted", []))
+            if cleanup["sub2api_accounts"]:
+                logger.info(
+                    "[免费号] 已从 sub2api 删除 %d 个远端账号: %s",
+                    len(cleanup["sub2api_accounts"]),
+                    cleanup["sub2api_accounts"],
+                )
+        except Exception as exc:
+            logger.warning("[免费号] 删除 sub2api 远端账号失败,跳过: %s (%s)", email, exc)
+
+    # ---- 步骤 3: 删 cloudmail 临时邮箱(仅 cleanup_remote=True)
+    if cleanup_remote:
+        mail_account_id = rec.get("mail_account_id")
+        mail_provider = rec.get("mail_provider") or ""
+        if mail_account_id is not None:
+            try:
+                from autoteam.mail_provider import get_mail_client
+
+                mail_client = get_mail_client(mail_provider or None)
+                mail_client.login()
+                resp = mail_client.delete_account(mail_account_id)
+                # CloudMail / cloudflare_temp_email 都按 ``{"code": 200}`` 形式回应
+                if isinstance(resp, dict) and resp.get("code") == 200:
+                    cleanup["cloudmail_deleted"] = True
+                    logger.info("[免费号] 已删除 cloudmail 邮箱: %s (id=%s)", email, mail_account_id)
+                else:
+                    logger.warning(
+                        "[免费号] cloudmail 删除返回非预期: %s (id=%s, resp=%s)",
+                        email,
+                        mail_account_id,
+                        resp,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[免费号] 删除 cloudmail 邮箱失败,跳过: %s (id=%s, %s)",
+                    email,
+                    mail_account_id,
+                    exc,
+                )
+
+    # ---- 步骤 4: 删 JSON 条目(放最后,避免前面失败仍影响本地数据)
     deleted = delete_free(email, admin_id=admin_id)
     if deleted is not None:
         cleanup["local_record"] = True

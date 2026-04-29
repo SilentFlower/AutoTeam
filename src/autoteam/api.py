@@ -2865,6 +2865,168 @@ def get_task(task_id: str):
 
 
 # ---------------------------------------------------------------------------
+# 免费号池(FREE)端点(PRD 04-29-free-account-generator)
+# ---------------------------------------------------------------------------
+#
+# FREE 池与 active 池在存储 / UI / 后台任务三个维度全部独立(PRD D2 隔离铁律):
+# - 存储独立:``data/admins/{admin_id}/free_accounts.json``,与 ``accounts.json`` 互不读写
+# - 业务命令独立:``free_accounts.cmd_generate_free_account / check_free_quota /
+#   delete_free_account``,与 ``manager.cmd_*`` 互相不可见
+# - 任务调度独立:走和 active 池一样的 ``_start_task`` / ``_playwright_lock``,
+#   但任务 command 名前缀 ``free_`` 用于区分,前端 TaskHistory 可按此分流
+#
+# 共享 sub2api group(PRD D3):FREE 池和 active 池写入同一个 ``SUB2API_GROUP``,
+# 删除操作走 ``sub2api_sync.delete_account_from_sub2api`` 命中 ``_KIND_POOL``。
+
+
+class FreeGenerateParams(BaseModel):
+    """``POST /api/free/generate`` 入参。"""
+
+    count: int = 1
+
+
+class FreeCheckQuotaParams(BaseModel):
+    """``POST /api/free/check_quota`` 入参。
+
+    ``emails=None`` → 默认刷新全部 active/exhausted 免费号(R5 默认行为);
+    显式传 list → 只刷新列表内的(包括 auth_failed 半成品)。
+    """
+
+    emails: list[str] | None = None
+
+
+def _sanitize_free_record(rec: dict) -> dict:
+    """返回前端可见的免费号 dict。
+
+    PRD 要求 FreePage 提供"复制 email + password"按钮(给用户做 fallback 登录用),
+    所以本端点会返回明文 password —— 调用方已经过 API Key 鉴权,与 ``/api/admin/*``
+    返回管理员凭据的语义一致。注意:**前端不要把 password 写日志或截图**,
+    后端 logger 也严守 logging-guidelines.md 的脱敏红线(本模块 logger 永远不
+    传 password 入参)。
+    """
+    # 明文返回所有字段;此处保留 dict.copy 是为了避免前端直接持有 free_accounts.json
+    # 引用,导致后续 update_free 写盘后前端误以为是新数据。
+    return dict(rec)
+
+
+@app.post("/api/free/generate", status_code=202)
+def post_free_generate(params: FreeGenerateParams):
+    """异步生成 N 个免费号(后台任务)。
+
+    内部走 ``free_accounts.cmd_generate_free_account``,该命令串行处理 N 条,
+    每轮包含完整 invite Step A + Codex OAuth Step B + remove + F2 二次确认 +
+    落库。生成成功后会自动触发一次 FREE → sub2api 同步。
+
+    返回 202 + 任务对象(含 ``task_id``),前端可轮询 ``GET /api/tasks/{task_id}``。
+    """
+    if params.count <= 0:
+        raise HTTPException(status_code=400, detail="生成数量必须为正整数")
+
+    # 与 cmd_add_via_invite 共用前置配置校验(母号会话 + sub2api / cloudmail 等运行时配置)
+    _require_pool_operation_configs("生成免费号")
+
+    from autoteam.free_accounts import cmd_generate_free_account
+
+    task = _start_task(
+        "free_generate",
+        cmd_generate_free_account,
+        {"count": params.count},
+        params.count,
+    )
+    return task
+
+
+@app.get("/api/free/list")
+def get_free_list(admin_id: str | None = Depends(get_current_admin_id)):
+    """返回当前 admin 的 FREE 池全部记录(含 last_quota 快照)。
+
+    响应包含明文 ``password``(PRD 要求 FreePage 提供"复制 email + password"按钮);
+    调用方已经过 API Key 鉴权,与 ``/api/admin/*`` 返回管理员凭据语义一致。详见
+    :func:`_sanitize_free_record` 注释。
+    """
+    from autoteam.free_accounts import load_free
+
+    records = _admin_state_call(load_free, admin_id)
+    return [_sanitize_free_record(r) for r in records]
+
+
+@app.post("/api/free/check_quota", status_code=202)
+def post_free_check_quota(params: FreeCheckQuotaParams):
+    """异步刷新免费号额度(后台任务)。
+
+    - ``emails=None`` → 刷新全部 status ∈ {active, exhausted} 的免费号(R5 默认);
+    - ``emails=[...]`` → 只刷新列表内的(包括 auth_failed 半成品),用于前端单条/选定刷新;
+    - 401 自动调 ``codex_auth.refresh_access_token`` 写回 auth_file 后重试一次。
+
+    串行执行,不并发。返回 202 + 任务对象。
+    """
+    from autoteam.free_accounts import check_free_quota
+
+    task = _start_task(
+        "free_check_quota",
+        check_free_quota,
+        {"emails": params.emails},
+        params.emails,
+    )
+    return task
+
+
+@app.post("/api/free/sync_sub2api")
+def post_free_sync_sub2api():
+    """触发一次 FREE → sub2api 同步(同步执行)。
+
+    复用 ``sub2api_sync.sync_free_to_sub2api``;若有任务正在跑则返回 409。
+    与 ``cmd_generate_free_account`` 末尾的自动同步是同一入口,这里只是给
+    FreePage 提供"手动重试"按钮的兜底。
+    """
+    _require_sync_target_configs("同步免费号到 sub2api")
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再试"))
+
+    try:
+        from autoteam.sub2api_sync import sync_free_to_sub2api
+
+        sync_free_to_sub2api()
+        return {"message": "FREE 池已同步到 sub2api"}
+    except Exception as exc:
+        logger.error("[免费号] sub2api 同步失败: %s", exc)
+        raise HTTPException(status_code=500, detail=f"同步失败: {exc}") from exc
+    finally:
+        _playwright_lock.release()
+
+
+@app.delete("/api/free/{email}")
+def delete_free_email(email: str, admin_id: str | None = Depends(get_current_admin_id)):
+    """级联删除免费号(本地 auth_file + sub2api 远端 + cloudmail 邮箱 + JSON 条目)。
+
+    每步独立 try/except(详见 :func:`free_accounts.delete_free_account`),
+    单步失败不阻塞其他步骤,最终把 cleanup 摘要透传给前端用于 toast 展示。
+
+    返回 cleanup 摘要 dict(R4 字段固定):
+    ``{local_record, local_auth_files, sub2api_accounts, cloudmail_deleted}``。
+    """
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再删除免费号"))
+
+    try:
+        from autoteam.free_accounts import delete_free_account, find_free, load_free
+
+        records = _admin_state_call(load_free, admin_id)
+        if find_free(records, email) is None:
+            raise HTTPException(status_code=404, detail="免费号不存在")
+
+        cleanup = _admin_state_call(delete_free_account, admin_id, email, cleanup_remote=True)
+        return {
+            "message": "免费号删除完成",
+            "deleted_email": email,
+            "cleanup": cleanup,
+        }
+    finally:
+        _playwright_lock.release()
+
+
+# ---------------------------------------------------------------------------
 # 后台自动巡检
 # ---------------------------------------------------------------------------
 
