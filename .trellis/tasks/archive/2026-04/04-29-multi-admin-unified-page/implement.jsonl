@@ -1,0 +1,8 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "后端规范入口：Python/uv/FastAPI/JSON 持久化的项目快照与落地原则"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "本任务要新建 admin_registry.py 模块、改造前端组件结构，需遵循模块组织约定"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "本任务彻底重构 JSON 存储路径(state.json/accounts.json/admins.json)，需守住 JSON 读写、向后兼容、字段命名约定"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "首次启动自动迁移、admin 不存在、Playwright 锁竞争等错误路径需要按规范实现"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "所有日志要加 admin_id 字段；admin 邮箱/凭据/session 不能进 logger"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "本任务横跨数据层→service→API→前端 store→UI，典型的多层重构"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "AdminLoginFlow 拆分复用、邀请加号双入口、AdminSwitcher 组件复用都是复用决策点"}
+{"file": ".trellis/tasks/04-29-multi-admin-unified-page/research/codebase-touchpoints.md", "reason": "本次任务的代码改造点索引：单实例耦合点、前端定位点、自动迁移流程、API 路由迁移清单"}
