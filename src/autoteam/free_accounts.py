@@ -335,6 +335,18 @@ def cmd_generate_free_account(count: int = 1, admin_id: str | None = None) -> li
             logger.error("[免费号] 第 %d/%d 个免费号生成异常: %s", index + 1, count, exc)
 
     logger.info("[免费号] 本次共落库 %d/%d 个免费号", len(generated), count)
+
+    # PRD R3 第 8 步:落库后触发一次 FREE → sub2api 同步,
+    # 与 ``cmd_add`` 末尾 ``sync_to_configured_targets()`` 的惯例对齐。
+    # 同步异常不应让生成命令本身失败——日志记一笔即可,用户可在 FreePage 手动重试。
+    if generated:
+        try:
+            from autoteam.sub2api_sync import sync_free_to_sub2api
+
+            sync_free_to_sub2api()
+        except Exception as exc:
+            logger.warning("[免费号] 落库后同步 sub2api 失败,可在 FreePage 手动重试: %s", exc)
+
     return generated
 
 

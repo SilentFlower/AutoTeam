@@ -286,6 +286,13 @@ def patch_generation_deps(monkeypatch, free_file):
         "autoteam.codex_auth.save_auth_file",
         lambda bundle, **_k: state["auth_file_path"],
     )
+    # cmd_generate_free_account 末尾会调 sub2api_sync.sync_free_to_sub2api(),
+    # 单元测试不应触达真实 HTTP——把它静默化成 no-op。
+    state["sync_calls"] = []
+    monkeypatch.setattr(
+        "autoteam.sub2api_sync.sync_free_to_sub2api",
+        lambda: state["sync_calls"].append("called"),
+    )
 
     state["factory_calls"] = chatgpt_factory_calls
     return state

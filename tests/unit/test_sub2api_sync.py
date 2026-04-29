@@ -537,3 +537,407 @@ def test_sync_main_codex_to_sub2api_creates_account_with_managed_defaults(monkey
     assert captured["extra"]["openai_oauth_responses_websockets_v2_enabled"] is True
     assert captured["extra"]["openai_passthrough"] is True
     assert "proxy_id" not in captured
+
+
+# ---------------------------------------------------------------------------
+# PR2 — 同步源参数化(``_collect_managed_targets`` + ``sync_free_to_sub2api``)
+# ---------------------------------------------------------------------------
+#
+# 背景:PRD ``04-29-free-account-generator`` R6 把 ``sync_to_sub2api`` 里
+# "枚举 active 账号"那段抽成 ``_collect_managed_targets(source)``,新增 FREE
+# 池入口 ``sync_free_to_sub2api()``。这里覆盖三类回归点:
+#
+# 1. ``_collect_managed_targets`` 按 source 走不同数据源,且分别只读各自的
+#    ``status=active`` 记录;
+# 2. ``_collect_all_managed_emails`` 在删除分支用并集,确保跨 source 互不误删;
+# 3. ``sync_to_sub2api()`` 默认 source=pool 仍用 ``accounts.STATUS_ACTIVE``
+#    过滤(零回归),``sync_free_to_sub2api()`` 走 free_accounts 数据源。
+
+
+def test_collect_managed_targets_pool_filters_only_active_accounts(monkeypatch, tmp_path):
+    """source=pool 走 accounts.load_accounts() + STATUS_ACTIVE 过滤。"""
+    auth_path = tmp_path / "codex-active@example.com-team-1.json"
+    auth_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [
+            {"email": "active@example.com", "status": "active", "auth_file": str(auth_path)},
+            {"email": "standby@example.com", "status": "standby", "auth_file": str(auth_path)},
+            {"email": "exhausted@example.com", "status": "exhausted", "auth_file": str(auth_path)},
+        ],
+    )
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_load_auth_data",
+        lambda path: {"email": "active@example.com", "access_token": "at"},
+    )
+
+    targets = sub2api_sync._collect_managed_targets("pool")
+
+    assert list(targets.keys()) == ["active@example.com"]
+    assert targets["active@example.com"]["name"] == "active@example.com"
+
+
+def test_collect_managed_targets_free_reads_free_accounts_json(monkeypatch, tmp_path):
+    """source=free 走 free_accounts.load_free() + FREE_STATUS_ACTIVE 过滤。"""
+    from autoteam import free_accounts
+
+    auth_path = tmp_path / "codex-free@example.com-team-1.json"
+    auth_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        free_accounts,
+        "load_free",
+        lambda: [
+            {"email": "free@example.com", "status": "active", "auth_file": str(auth_path)},
+            # auth_failed 半成品不应被 sub2api 同步
+            {"email": "halfdone@example.com", "status": "auth_failed", "auth_file": None},
+            # exhausted 也不进 sub2api(只在用户刷新额度时打标)
+            {"email": "exhausted@example.com", "status": "exhausted", "auth_file": str(auth_path)},
+        ],
+    )
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_load_auth_data",
+        lambda path: {"email": "free@example.com", "access_token": "at"},
+    )
+
+    targets = sub2api_sync._collect_managed_targets("free")
+
+    assert list(targets.keys()) == ["free@example.com"]
+
+
+def test_collect_managed_targets_pool_does_not_read_free_accounts(monkeypatch):
+    """D2 隔离铁律:pool 同步源不应读 free_accounts.json。"""
+    monkeypatch.setattr("autoteam.accounts.load_accounts", lambda: [])
+
+    free_load_calls = {"n": 0}
+
+    def _spy_free_load():
+        free_load_calls["n"] += 1
+        return []
+
+    monkeypatch.setattr("autoteam.free_accounts.load_free", _spy_free_load)
+
+    sub2api_sync._collect_managed_targets("pool")
+
+    assert free_load_calls["n"] == 0
+
+
+def test_collect_managed_targets_rejects_unknown_source():
+    with pytest.raises(ValueError, match="未知同步来源"):
+        sub2api_sync._collect_managed_targets("unknown")  # type: ignore[arg-type]
+
+
+def test_collect_all_managed_emails_unions_pool_and_free(monkeypatch):
+    """两边同时贡献邮箱;集合用于删除分支判定"应保留"。"""
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "Pool@Example.com"}, {"email": ""}, {"email": "shared@example.com"}],
+    )
+    monkeypatch.setattr(
+        "autoteam.free_accounts.load_free",
+        lambda: [{"email": "free@example.com"}, {"email": "SHARED@example.com"}],
+    )
+
+    emails = sub2api_sync._collect_all_managed_emails()
+
+    # 全部 lower-case + 非空;active 池和 FREE 池都贡献了元素;共享邮箱去重
+    assert emails == {"pool@example.com", "free@example.com", "shared@example.com"}
+
+
+def test_collect_all_managed_emails_continues_when_one_side_raises(monkeypatch):
+    """单边读取失败不影响另一边——任何一边异常都不阻塞全集计算。"""
+
+    def _explode():
+        raise RuntimeError("disk error")
+
+    monkeypatch.setattr("autoteam.accounts.load_accounts", _explode)
+    monkeypatch.setattr(
+        "autoteam.free_accounts.load_free",
+        lambda: [{"email": "free@example.com"}],
+    )
+
+    emails = sub2api_sync._collect_all_managed_emails()
+
+    # active 侧虽然抛错,但 FREE 侧仍贡献了 free@example.com
+    assert emails == {"free@example.com"}
+
+
+def test_sync_to_sub2api_pool_does_not_delete_remote_account_owned_by_free_pool(monkeypatch, tmp_path):
+    """关键互不误删测试:active 同步时,FREE 池里有这个 email,远端账号应被保留。
+
+    场景:
+    - active 池本地无 active 状态账号(active_targets 为空);
+    - 远端有一条 sub2api 管理账号 ``free@example.com``;
+    - FREE 池里也有 ``free@example.com``(active 状态);
+    - 期望:删除分支判定"应保留",不删该远端账号。
+
+    若 PR2 没把 ``local_emails`` 切换成并集,这里会回到旧行为
+    (active 侧的 local_emails 包含 free@example.com,active_targets 不包含 → 误删)。
+    """
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([], []))
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+    # 关键:active 池里挂着 free@example.com 但 status=standby(不进 active_targets)
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "free@example.com", "status": "standby", "auth_file": ""}],
+    )
+    # FREE 池里 free@example.com 是 active(应保留)
+    monkeypatch.setattr(
+        "autoteam.free_accounts.load_free",
+        lambda: [{"email": "free@example.com", "status": "active", "auth_file": ""}],
+    )
+    # 远端只有 free@example.com 一条 managed 账号
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_dedupe_managed_accounts",
+        lambda token, items, *, kind: (
+            {
+                "free@example.com": {
+                    "id": 99,
+                    "status": "active",
+                    "credentials": {"email": "free@example.com"},
+                    "extra": {},
+                    "group_ids": [],
+                }
+            },
+            0,
+        ),
+    )
+
+    deleted = []
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_delete_account",
+        lambda token, account, **kwargs: deleted.append((account.get("id"), kwargs.get("label"))),
+    )
+
+    result = sub2api_sync.sync_to_sub2api()  # 默认 source=pool
+
+    # 关键断言:无任何远端删除发生(FREE 池保护了 free@example.com)
+    assert deleted == []
+    assert result["deleted"] == 0
+
+
+def test_sync_to_sub2api_pool_still_deletes_orphan_remote_account(monkeypatch, tmp_path):
+    """active 同步删除分支保留:远端孤儿账号(两边本地都没有)仍要删——这是原行为的核心。
+
+    场景:
+    - active 池里有 ``orphan@example.com``,但 status=standby(不在 active_targets);
+    - FREE 池为空;
+    - 远端有 ``orphan@example.com``;
+    - 期望:删除该远端账号(原行为:email in local_emails 且 not in active_targets)。
+    """
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([], []))
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "orphan@example.com", "status": "standby", "auth_file": ""}],
+    )
+    monkeypatch.setattr("autoteam.free_accounts.load_free", lambda: [])
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_dedupe_managed_accounts",
+        lambda token, items, *, kind: (
+            {
+                "orphan@example.com": {
+                    "id": 77,
+                    "status": "active",
+                    "credentials": {"email": "orphan@example.com"},
+                    "extra": {},
+                    "group_ids": [],
+                }
+            },
+            0,
+        ),
+    )
+
+    deleted = []
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_delete_account",
+        lambda token, account, **kwargs: deleted.append((account.get("id"), kwargs.get("label"))),
+    )
+
+    result = sub2api_sync.sync_to_sub2api()
+
+    # 远端孤儿账号仍被删——这是 active 池原行为的保留断言
+    assert deleted == [(77, "删除非 active 账号")]
+    assert result["deleted"] == 1
+
+
+def test_sync_free_to_sub2api_creates_account_from_free_pool(monkeypatch, tmp_path):
+    """FREE 入口:从 free_accounts.json 读 active 状态条目并在远端创建。"""
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([7], ["Team Pool"]))
+    monkeypatch.setattr(sub2api_sync, "_resolve_proxy_id", lambda token: None)
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+    monkeypatch.setattr(sub2api_sync, "_dedupe_managed_accounts", lambda token, items, *, kind: ({}, 0))
+
+    auth_path = tmp_path / "codex-free@example.com-team-1.json"
+    auth_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr("autoteam.accounts.load_accounts", lambda: [])
+    monkeypatch.setattr(
+        "autoteam.free_accounts.load_free",
+        lambda: [
+            {
+                "email": "free@example.com",
+                "status": "active",
+                "auth_file": str(auth_path),
+                "last_quota": {"primary_pct": 5, "weekly_pct": 8},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_load_auth_data",
+        lambda path: {
+            "email": "free@example.com",
+            "access_token": "at-1",
+            "refresh_token": "rt-1",
+        },
+    )
+
+    captured = {}
+
+    def fake_create_account(token, **kwargs):
+        captured.update(kwargs)
+        return {"id": 99}
+
+    monkeypatch.setattr(sub2api_sync, "_create_account", fake_create_account)
+
+    result = sub2api_sync.sync_free_to_sub2api()
+
+    assert result["created"] == 1
+    # group 与 active 池共用 (D3 锁定:不引入 SUB2API_FREE_GROUP)
+    assert captured["group_ids"] == [7]
+    # 标记 kind=pool(D3 决定 FREE 与 active 共用一个 sub2api group/kind)
+    assert captured["extra"]["autoteam_kind"] == "pool"
+    assert captured["extra"]["autoteam_email"] == "free@example.com"
+
+
+def test_sync_free_to_sub2api_does_not_delete_active_pool_remote_account(monkeypatch, tmp_path):
+    """FREE 同步反向不误删:远端属于 active 池的账号,FREE 同步时应保留。
+
+    场景:
+    - FREE 池为空;
+    - active 池里有 ``active@example.com``;
+    - 远端有 ``active@example.com``;
+    - 期望:FREE 同步走删除分支时,active 池里有这个 email → 应保留。
+    """
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([], []))
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "active@example.com", "status": "active", "auth_file": ""}],
+    )
+    monkeypatch.setattr("autoteam.free_accounts.load_free", lambda: [])
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_dedupe_managed_accounts",
+        lambda token, items, *, kind: (
+            {
+                "active@example.com": {
+                    "id": 55,
+                    "status": "active",
+                    "credentials": {"email": "active@example.com"},
+                    "extra": {},
+                    "group_ids": [],
+                }
+            },
+            0,
+        ),
+    )
+
+    deleted = []
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_delete_account",
+        lambda token, account, **kwargs: deleted.append((account.get("id"), kwargs.get("label"))),
+    )
+
+    result = sub2api_sync.sync_free_to_sub2api()
+
+    assert deleted == []
+    assert result["deleted"] == 0
+
+
+def test_sync_free_to_sub2api_deletes_remote_when_pool_email_no_longer_active(monkeypatch):
+    """FREE 同步保留原行为:active 池里 ``email`` 是 standby/exhausted(非 active),
+    且 FREE 池没有该 email,远端这条历史 managed 账号应被清理。
+
+    场景:active 池里有 ``orphan@example.com`` 但 status=standby(不在任何 active 集合)。
+    并集应保留集合 ``keep_emails`` = active(空)+ FREE active(空)= 空。
+    限定符 ``all_local_emails`` 包含该 email(active 池任何 status 都贡献)→ 应删。
+    """
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([], []))
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "orphan@example.com", "status": "standby", "auth_file": ""}],
+    )
+    monkeypatch.setattr("autoteam.free_accounts.load_free", lambda: [])
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_dedupe_managed_accounts",
+        lambda token, items, *, kind: (
+            {
+                "orphan@example.com": {
+                    "id": 33,
+                    "status": "active",
+                    "credentials": {"email": "orphan@example.com"},
+                    "extra": {},
+                    "group_ids": [],
+                }
+            },
+            0,
+        ),
+    )
+
+    deleted = []
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_delete_account",
+        lambda token, account, **kwargs: deleted.append(account.get("id")),
+    )
+
+    sub2api_sync.sync_free_to_sub2api()
+
+    # standby 账号在两边都不是 active → 不属于"应保留",FREE 同步顺手清理
+    # (这是历史 active 池清理 standby 残留行为的镜像版本,在 FREE 入口同样保留)
+    assert deleted == [33]
+
+
+def test_sync_free_to_sub2api_skips_auth_failed_records(monkeypatch, tmp_path):
+    """半成品(status=auth_failed)条目不进 sub2api 同步:它们没 auth_file。"""
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([], []))
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+    monkeypatch.setattr(sub2api_sync, "_dedupe_managed_accounts", lambda token, items, *, kind: ({}, 0))
+    monkeypatch.setattr("autoteam.accounts.load_accounts", lambda: [])
+    monkeypatch.setattr(
+        "autoteam.free_accounts.load_free",
+        lambda: [
+            {"email": "halfdone@example.com", "status": "auth_failed", "auth_file": None},
+        ],
+    )
+
+    create_calls = {"n": 0}
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_create_account",
+        lambda token, **k: create_calls.update({"n": create_calls["n"] + 1}) or {"id": 1},
+    )
+
+    result = sub2api_sync.sync_free_to_sub2api()
+
+    # 半成品被跳过 → 没有任何创建动作
+    assert create_calls["n"] == 0
+    assert result["created"] == 0
