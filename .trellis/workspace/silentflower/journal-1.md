@@ -174,3 +174,37 @@ PRD 与 PR1 实际实现 100% 对齐:
 3. 处理 multi-admin 那 36 个 baseline failed
 
 倾向 1。等用户决定。
+
+
+## Session 4: FREE 号 reauth-after-remove + FreePage 重新登录按钮
+
+**Date**: 2026-04-29
+**Task**: FREE 号 reauth-after-remove + FreePage 重新登录按钮
+**Branch**: `new`
+
+### Summary
+
+fix sub2api token_invalidated 401: 主流程加 Step C(remove 后 OAuth 拿 personal bundle 落 auth_file); login_codex_via_browser/_login_codex_with_result 加 allow_non_team(默认 False 兼容主号); 新增 reauth_free_account()+POST /api/free/{email}/reauth 异步入口+并发锁; FreePage 行操作加「重新登录」琥珀按钮; 测试覆盖 Step C 调用次数/参数+reauth 成功失败/并发/锁释放 共 10 个新单测; ruff/pytest/compileall 全绿。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `ef407f5` | (see git log) |
+| `1cf17e5` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
