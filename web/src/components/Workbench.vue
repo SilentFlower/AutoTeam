@@ -1,7 +1,13 @@
 <template>
   <div class="space-y-6">
     <!-- 顶部 toolbar：admin 切换器 + 邀请加号主按钮 + 刷新 -->
-    <div class="glass-card flex flex-col gap-4 p-4 lg:flex-row lg:items-center lg:justify-between">
+    <!--
+      relative z-20 是为了让 AdminSwitcher 内部的 absolute 下拉能盖住下方的 tab 行卡片。
+      .glass-card 自带 backdrop-blur-xl 会创建独立层叠上下文,两个兄弟卡片(toolbar 与 tab 行)
+      默认按 DOM 顺序绘制,后者会覆盖前者内 absolute 子元素的 z-index。给 toolbar 抬一档
+      stacking 优先级即可解决遮挡;modal/sidebar 都在 z-40+,不会被影响。
+    -->
+    <div class="glass-card relative z-20 flex flex-col gap-4 p-4 lg:flex-row lg:items-center lg:justify-between">
       <div class="flex flex-wrap items-center gap-3">
         <AdminSwitcher @add-admin="openAddAdmin" @switched="onAdminSwitched" />
         <span class="text-xs text-slate-500">切换主号后，下方四个 tab 会刷新到该主号上下文</span>

@@ -56,7 +56,6 @@ from autoteam.codex_auth import (
     save_auth_file,
 )
 from autoteam.config import get_playwright_launch_options
-from autoteam.cpa_sync import sync_from_cpa
 from autoteam.mail_provider import (
     get_account_mail_provider,
     get_mail_client_for_account,
@@ -67,10 +66,8 @@ from autoteam.mail_provider import (
     get_mail_client as CloudMailClient,
 )
 from autoteam.sync_targets import (
-    sync_main_codex_to_configured_targets as sync_main_codex_to_cpa,
-)
-from autoteam.sync_targets import (
-    sync_to_configured_targets as sync_to_cpa,
+    sync_main_codex_to_configured_targets,
+    sync_to_configured_targets,
 )
 from autoteam.textio import read_text, write_text
 
@@ -93,6 +90,25 @@ def _chatgpt_session_ready(chatgpt_api) -> bool:
 
 
 AUTH_REPAIR_HARD_FAILURE_TYPES = {"add_phone", "human_verification"}
+
+
+def _is_hard_failure(error_type: str | None) -> bool:
+    """判断给定错误类型是否属于"硬失败"——硬失败会直接暂停账号自动修复。
+
+    ``add_phone`` 默认是硬失败,但当配置了 HeroSMS 自动接码时降级为可重试,
+    避免每次手机号验证都触发暂停。
+    """
+    if not error_type:
+        return False
+    if error_type == "add_phone":
+        try:
+            from autoteam.hero_sms import is_hero_sms_configured
+
+            if is_hero_sms_configured():
+                return False
+        except Exception:
+            pass
+    return error_type in AUTH_REPAIR_HARD_FAILURE_TYPES
 
 
 def _normalized_email(value: str | None) -> str:
@@ -152,6 +168,42 @@ def _has_auth_file(acc: dict | None) -> bool:
     acc = acc or {}
     auth_file = (acc.get("auth_file") or "").strip()
     return bool(auth_file) and Path(auth_file).exists()
+
+
+def _recover_stale_auth_file(acc: dict, auth_dir: Path | None = None) -> bool:
+    """若 ``acc.auth_file`` 指向的文件已不存在,尝试在 per-admin auths 目录里
+    按 email 回查 ``codex-{email}-*.json`` 兜底,找到则就地更新 ``acc['auth_file']``
+    并返回 True;否则返回 False。
+
+    背景:multi-admin 迁移会把 auth 文件从项目根 ``auths/`` 搬到
+    ``data/admins/{admin_id}/auths/``,但旧的 ``accounts.json`` 中 ``auth_file``
+    字段仍是绝对的旧路径,导致 ``_has_auth_file`` 误判 → 同步时被错标 auth_pending。
+    本函数用于自愈这类脏数据。
+
+    :param acc: 账号字典(就地修改 ``auth_file`` 字段)
+    :param auth_dir: 当前 admin 的 auths 目录;为空时按当前激活 admin 解析
+    :return: 是否成功恢复 ``auth_file`` 路径
+    """
+    if not isinstance(acc, dict):
+        return False
+    current = (acc.get("auth_file") or "").strip()
+    if current and Path(current).exists():
+        return False  # 路径未失效,无需自愈
+    email = (acc.get("email") or "").strip().lower()
+    if not email:
+        return False
+    if auth_dir is None:
+        from autoteam.auth_storage import get_auth_dir
+
+        auth_dir = get_auth_dir()
+    if not auth_dir.exists():
+        return False
+    candidates = sorted(auth_dir.glob(f"codex-{email}-*.json"))
+    for cand in candidates:
+        if cand.is_file():
+            acc["auth_file"] = str(cand)
+            return True
+    return False
 
 
 def _pool_active_target(team_target: int) -> int:
@@ -275,7 +327,7 @@ def _record_auth_repair_failure(email: str, error_type: str | None = None, error
     error_detail = error_detail or _auth_repair_error_label(error_type)
     retry_delays = _auth_repair_retry_delays()
 
-    if error_type in AUTH_REPAIR_HARD_FAILURE_TYPES:
+    if _is_hard_failure(error_type):
         retry_count = max(int(acc.get("auth_retry_count") or 0), len(retry_delays))
         state = {
             "auth_retry_count": retry_count,
@@ -373,7 +425,7 @@ def _login_codex_with_result(email: str, password: str, *, mail_client=None, max
         last_result = result
         error_type = result.get("error_type")
         retryable = bool(result.get("retryable"))
-        if attempt >= max_attempts or not retryable or error_type in AUTH_REPAIR_HARD_FAILURE_TYPES:
+        if attempt >= max_attempts or not retryable or _is_hard_failure(error_type):
             return result
 
         logger.warning(
@@ -431,6 +483,13 @@ def sync_account_states(chatgpt_api=None):
     domain_suffix = domain_value.lstrip("@") if domain_value else ""
     current_mail_provider = get_mail_provider_name()
 
+    # 当前 admin 的 auths 目录:multi-admin 模式下是 data/admins/{id}/auths/,
+    # 老部署兜底回项目根 auths/。下面同步逻辑统一用这个目录,避免旧的全局
+    # AUTH_DIR 常量在 multi-admin 场景里指向错误位置。
+    from autoteam.auth_storage import get_auth_dir
+
+    auth_dir = get_auth_dir()
+
     changed = False
     local_email_set = {a["email"].lower() for a in accounts}
 
@@ -441,7 +500,21 @@ def sync_account_states(chatgpt_api=None):
         if in_team:
             if acc["status"] == STATUS_EXHAUSTED:
                 continue
+
+            # multi-admin 迁移自愈:旧记录的 auth_file 可能还指向项目根 auths/,
+            # 实际文件已经搬到 per-admin 目录;此时按 email 回查并修正路径。
+            if _recover_stale_auth_file(acc, auth_dir):
+                changed = True
+                logger.info("[同步] 自愈过期的 auth_file 路径: %s -> %s", email, acc["auth_file"])
+
             if acc["status"] == STATUS_AUTH_PENDING:
+                # 之前因为找不到 auth_file 才被标 pending,如果现在恢复成功就直接升回 ACTIVE,
+                # 同时清空 auth-repair 计数,避免后续误以为账号还在重试中。
+                if _has_auth_file(acc):
+                    acc["status"] = STATUS_ACTIVE
+                    acc.update(_auth_repair_reset_fields())
+                    changed = True
+                    logger.info("[同步] auth_file 已恢复,%s 由 auth_pending 升回 active", email)
                 continue
 
             desired_status = STATUS_ACTIVE if _has_auth_file(acc) else STATUS_AUTH_PENDING
@@ -479,11 +552,12 @@ def sync_account_states(chatgpt_api=None):
                 logger.info("[同步] 发现 Team 中新成员: %s（已添加到本地，状态=auth_pending）", email)
 
     # auths 目录中有认证文件但本地无记录的 → 自动添加为 standby
-    from autoteam.codex_auth import AUTH_DIR
-
+    # 注意:这里必须使用 per-admin 的 auths 目录(由前面 get_auth_dir() 解析得到),
+    # 否则在 multi-admin 模式下会扫到旧的全局 auths/(空目录或他 admin 残留),
+    # 导致新归属的认证文件无法被识别。
     local_email_set = {a["email"].lower() for a in accounts}  # 刷新一下
-    if AUTH_DIR.exists():
-        for auth_file in AUTH_DIR.glob("codex-*.json"):
+    if auth_dir.exists():
+        for auth_file in auth_dir.glob("codex-*.json"):
             try:
                 auth_data = json.loads(read_text(auth_file))
                 email = auth_data.get("email", "").lower()
@@ -730,7 +804,7 @@ def cmd_check(force_auth_repair=False):
                     email,
                     remove_remote=True,
                     remove_cloudmail=True,
-                    sync_cpa_after=False,
+                    sync_remote_after=False,
                     chatgpt_api=chatgpt,
                     mail_client=mail_client,
                     remote_state=(members, invites),
@@ -744,7 +818,7 @@ def cmd_check(force_auth_repair=False):
 
         if deleted_pending:
             logger.info("[检查] 已删除 %d 个失败 pending 账号", deleted_pending)
-            sync_to_cpa()
+            sync_to_configured_targets()
 
         accounts = load_accounts()
 
@@ -2331,7 +2405,7 @@ def cmd_rotate(target_seats=5, force_auth_repair=False):
             chatgpt.stop()
         # 所有操作完成后统一同步远端，避免中途同步导致远端状态不一致
         logger.info("[轮转] 轮转完成，同步已启用远端...")
-        sync_to_cpa()
+        sync_to_configured_targets()
         logger.info("[轮转] 完成，使用 status 命令查看最新状态")
 
 
@@ -2346,7 +2420,7 @@ def cmd_add():
         result = create_new_account(chatgpt, mail_client)  # 内部会 stop chatgpt
         if result:
             logger.info("[添加] 新账号添加成功: %s", result)
-            sync_to_cpa()
+            sync_to_configured_targets()
         else:
             logger.error("[添加] 添加失败")
     finally:
@@ -2354,38 +2428,279 @@ def cmd_add():
             chatgpt.stop()
 
 
-def cmd_manual_add():
-    """手动添加账号：优先自动接收 localhost 回调，失败时再手动粘贴回调 URL。"""
-    from autoteam.manual_account import ManualAccountFlow
+def _run_invite_login_flow(email, password, mail_account_id, mail_client, invite_link):
+    """执行"邀请链接登录 + Codex OAuth"两步,把账号从 PENDING 推进到 ACTIVE/AUTH_PENDING。
 
-    flow = ManualAccountFlow()
+    本函数假定:
+    - 账号已经在 accounts.json 里(status=PENDING、add_via_invite=True、密码已写入);
+    - 母号已经发出邀请;
+    - 邀请链接已经从邮件里提取出来。
+
+    :param email: 临时邮箱
+    :param password: 该账号在 accounts.json 中保存的密码,用于"设置密码"步骤填入,
+        随后 Codex OAuth 也直接复用同一密码
+    :param mail_account_id: 临时邮箱在邮箱服务侧的 account id(可能为 None)
+    :param mail_client: 已登录的 mail_client(用于读 OTP)
+    :param invite_link: 邀请邮件中提取的邀请链接
+    :return: 成功时返回 email;失败返回 None(账号会留在 PENDING/AUTH_PENDING 待下次恢复)
+    """
+    from playwright.sync_api import sync_playwright
+
+    from autoteam.invite import login_with_invite
+
+    # Step A: 浏览器打开邀请链接,走"邮箱 + 密码 + OTP"路径加入 workspace
+    joined = False
     try:
-        result = flow.start()
-        logger.info("[手动添加] 打开以下链接完成 OAuth 登录：\n%s", result["auth_url"])
-        if result.get("auto_callback_available"):
-            logger.info("[手动添加] 已启动本地回调服务 http://localhost:1455/auth/callback，可自动完成认证")
-        else:
-            logger.warning("[手动添加] 本地自动回调不可用：%s", result.get("auto_callback_error") or "未知错误")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(**get_playwright_launch_options())
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 800},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+                ),
+            )
+            page = context.new_page()
+            joined = login_with_invite(page, invite_link, email, mail_client, password)
+            browser.close()
+    except Exception as exc:
+        logger.error("[邀请加号] 邀请链接登录异常: %s", exc)
 
-        callback_url = input("登录成功后：若自动完成则直接回车；否则粘贴回调 URL（留空取消）: ").strip()
-        if callback_url:
-            result = flow.submit_callback(callback_url)
-        else:
-            result = flow.status()
-            if result.get("status") != "completed":
-                logger.warning("[手动添加] 未检测到自动回调，已取消")
-                return None
+    if not joined:
+        logger.error("[邀请加号] 邀请链接登录未完成,保留 PENDING 等待下次恢复: %s", email)
+        return None
 
-        account = result.get("account") or {}
-        logger.info(
-            "[手动添加] 完成: %s (plan=%s, status=%s)",
-            account.get("email") or "?",
-            account.get("plan_type") or "?",
-            account.get("status") or "?",
+    # Step B: 单独走一轮 Codex OAuth,直接用上一步设置的密码登录
+    login_result = _login_codex_with_result(email, password, mail_client=mail_client)
+    bundle = login_result.get("bundle")
+    if login_result.get("ok") and bundle:
+        auth_file = save_auth_file(bundle)
+        update_account(email, status=STATUS_ACTIVE, auth_file=auth_file, last_active_at=time.time())
+        _auth_repair_reset(email)
+        logger.info("[邀请加号] 账号就绪: %s", email)
+        return email
+
+    update_account(email, status=STATUS_AUTH_PENDING)
+    state = _record_auth_repair_failure(email, login_result.get("error_type"), login_result.get("error_detail"))
+    extra = _auth_repair_state_suffix(state)
+    logger.warning(
+        "[邀请加号] 已加入 Team 但 Codex 登录失败,标记 auth_pending: %s(%s%s)",
+        email,
+        _auth_repair_error_label(state.get("auth_last_error")),
+        extra,
+    )
+    return email
+
+
+def _resume_invite_logins(chatgpt_api, mail_client):
+    """扫描本地未完成的"邀请加号"账号,逐个尝试恢复。
+
+    判定一个账号"未完成"需要同时满足:
+    - status == STATUS_PENDING
+    - 标记位 add_via_invite == True(用以区别于旧的 register_with_invite 流程产生的 pending)
+    - 邮箱仍出现在母号的远端 pending invites 列表里(否则邀请已被接受/取消/过期)
+
+    对每个未完成账号:
+    1. 用账号自带的邮箱绑定信息找到对应 mail_client(可能复用入参,也可能新建);
+    2. 重新去邮件里搜索 OpenAI 邀请邮件,提取最新邀请链接;
+    3. 调用 _run_invite_login_flow 推进流程。
+
+    :param chatgpt_api: 已 start 的 ChatGPTTeamAPI 母号会话,函数内部需要它拉远端 pending invites
+    :param mail_client: 调用方默认的 mail_client,作为同 provider 的复用候选
+    :return: 本轮成功推进到 ACTIVE/AUTH_PENDING 的邮箱列表
+    """
+    accounts = load_accounts()
+    pending = [
+        a for a in accounts
+        if a.get("status") == STATUS_PENDING and a.get("add_via_invite")
+    ]
+    if not pending:
+        return []
+
+    logger.info("[邀请加号] 发现 %d 个未完成的邀请加号,尝试恢复...", len(pending))
+
+    # 拉远端 pending invites,用于过滤掉已经过期/被取消的账号
+    try:
+        _members, remote_invites = fetch_team_state(chatgpt_api)
+    except Exception as exc:
+        logger.warning("[邀请加号] 拉取远端 pending invites 失败,跳过本轮恢复: %s", exc)
+        return []
+    remote_invite_emails = {
+        (inv.get("email_address") or inv.get("email") or "").lower()
+        for inv in remote_invites
+    }
+
+    completed = []
+    # 一旦下面的 _run_invite_login_flow 用浏览器,母号会话必须先停;只在第一个候选时停
+    chatgpt_stopped = False
+
+    for acc in pending:
+        email = acc.get("email") or ""
+        if not email:
+            continue
+        if email.lower() not in remote_invite_emails:
+            logger.info("[邀请加号] %s 不在远端 pending invites,跳过(可能已过期/取消)", email)
+            continue
+
+        # 找对应 mail_client(同 provider 直接复用,否则按账号绑定重建)
+        desired_provider = get_account_mail_provider(acc)
+        if desired_provider and getattr(mail_client, "provider_name", "") != desired_provider:
+            try:
+                this_mail_client = _get_account_mail_client(acc)
+                this_mail_client.login()
+            except Exception as exc:
+                logger.warning("[邀请加号] %s 邮箱客户端不可用,跳过: %s", email, exc)
+                continue
+        else:
+            this_mail_client = mail_client
+
+        # 邀请发出后母号会话不能继续占用浏览器,首个候选恢复时统一停
+        if not chatgpt_stopped and _chatgpt_session_ready(chatgpt_api):
+            chatgpt_api.stop()
+            chatgpt_stopped = True
+
+        # 重新从邮件里提取邀请链接
+        invite_link = None
+        try:
+            for em in this_mail_client.search_emails_by_recipient(email, size=10):
+                sender = (em.get("sendEmail") or "").lower()
+                if "openai" not in sender:
+                    continue
+                invite_link = this_mail_client.extract_invite_link(em)
+                if invite_link:
+                    break
+        except Exception as exc:
+            logger.warning("[邀请加号] %s 搜邀请邮件失败: %s", email, exc)
+            continue
+
+        if not invite_link:
+            logger.info("[邀请加号] %s 暂未在邮件里找到邀请链接,跳过本轮", email)
+            continue
+
+        logger.info("[邀请加号] 恢复 %s ...", email)
+        result_email = _run_invite_login_flow(
+            email,
+            acc.get("password") or "",
+            acc.get("mail_account_id") or acc.get("cloudmail_account_id"),
+            this_mail_client,
+            invite_link,
         )
-        return result
+        if result_email:
+            completed.append(result_email)
+
+    return completed
+
+
+def create_account_via_invite(chatgpt_api, mail_client):
+    """以"母号邀请 + 邀请链接登录"方式创建一个新账号(MVP 版)。
+
+    与 ``create_account_direct`` 的差异:
+    - 不在 ChatGPT 注册页直接 sign up,而是先让母号经 API 发出 Team 邀请;
+    - 通过临时邮箱拿到邀请链接,Playwright 打开后走"邮箱 + 密码 + OTP"路径接受邀请,
+      不需要填生日/姓名等额外资料(由邀请上下文自动跳过这些步骤);
+    - 加入 workspace 之后再单独走一轮 Codex OAuth(复用 _login_codex_with_result)。
+
+    持久化策略: 母号邀请发出之后立即把账号写入 accounts.json(status=PENDING,
+    add_via_invite=True,密码已生成并保存)。后续任何一步失败,账号都会保留在 PENDING,
+    下一次 cmd_add_via_invite 启动时基于"远端 pending invite + 邮件搜邀请链接 +
+    本地保存的密码"自动恢复,无需重新发邀请、无需本地存邀请 URL。
+
+    :param chatgpt_api: 已 start 的 ChatGPTTeamAPI 实例(母号会话);函数内部会在邀请发出后将其 stop,
+        以释放浏览器供后续 invite-login + Codex OAuth 使用
+    :param mail_client: 已登录的 mail_client 实例(用于创建临时邮箱、收邀请邮件、收 OTP)
+    :return: 成功时返回新账号邮箱;失败返回 None
+    """
+    import uuid
+
+    # Step 1: 创建临时邮箱
+    mail_account_id, email = mail_client.create_temp_email()
+    logger.info("[邀请加号] 临时邮箱: %s", email)
+
+    # Step 2: 母号发起邀请
+    invited = invite_to_team(chatgpt_api, email)
+    if not invited:
+        logger.error("[邀请加号] 母号邀请失败,放弃: %s", email)
+        try:
+            mail_client.delete_account(mail_account_id)
+        except Exception as exc:
+            logger.warning("[邀请加号] 删除失败临时邮箱异常: %s", exc)
+        return None
+
+    # Step 3: 邀请已发出,立即落盘做持久化。生成符合 OpenAI 复杂度要求的密码
+    # (大小写字母 + 数字 + 符号),用作"设置密码"步骤的输入,后续 Codex OAuth 也复用同一密码。
+    password = f"Tmp_{uuid.uuid4().hex[:12]}!"
+    add_account(
+        email,
+        password,
+        cloudmail_account_id=mail_account_id if getattr(mail_client, "provider_name", "") == "cloudmail" else None,
+        mail_provider=getattr(mail_client, "provider_name", ""),
+        mail_account_id=mail_account_id,
+    )
+    update_account(email, add_via_invite=True)
+
+    # 邀请发出后释放母号浏览器,避免与后续 Playwright 会话冲突
+    if _chatgpt_session_ready(chatgpt_api):
+        chatgpt_api.stop()
+
+    # Step 4: 等待邀请邮件,提取邀请链接
+    invite_link = None
+    try:
+        email_data = mail_client.wait_for_email(
+            to_email=email,
+            timeout=180,
+            sender_keyword="openai",
+        )
+        invite_link = mail_client.extract_invite_link(email_data)
+    except TimeoutError:
+        logger.error("[邀请加号] 等待邀请邮件超时,保留 PENDING 等待下次恢复: %s", email)
+        return None
+    except Exception as exc:
+        logger.error("[邀请加号] 获取邀请邮件失败,保留 PENDING 等待下次恢复: %s (%s)", email, exc)
+        return None
+
+    if not invite_link:
+        logger.error("[邀请加号] 未获取到邀请链接,保留 PENDING 等待下次恢复: %s", email)
+        return None
+    logger.info("[邀请加号] 邀请链接: %s", invite_link)
+
+    # Step 5+6: 邀请登录 + Codex OAuth(失败也只是停在 PENDING/AUTH_PENDING)
+    return _run_invite_login_flow(email, password, mail_account_id, mail_client, invite_link)
+
+
+def cmd_add_via_invite():
+    """命令入口:执行一次"母号邀请 + 邀请链接登录 + Codex OAuth"流程,新增一个账号。
+
+    持久化恢复优先: 先扫一遍本地 add_via_invite=True 的 PENDING 账号尝试恢复;
+    本轮如果 resume 出至少一个完成的账号,就不再创建新邮箱,以减少浪费、按用户期望
+    "下次没完成的还继续"。
+    """
+    chatgpt = ChatGPTTeamAPI()
+    chatgpt.start()
+    mail_client = CloudMailClient()
+    mail_client.login()
+
+    try:
+        # Step 0: 先尝试恢复未完成的邀请加号
+        resumed = _resume_invite_logins(chatgpt, mail_client)
+        if resumed:
+            logger.info("[邀请加号] 本轮恢复了 %d 个未完成账号: %s", len(resumed), resumed)
+            sync_to_configured_targets()
+            return
+
+        # 母号会话可能已被 _resume_invite_logins 内部停掉,这里若需要继续创建新号则重启
+        if not _chatgpt_session_ready(chatgpt):
+            chatgpt = ChatGPTTeamAPI()
+            chatgpt.start()
+
+        result = create_account_via_invite(chatgpt, mail_client)
+        if result:
+            logger.info("[邀请加号] 新账号添加成功: %s", result)
+            sync_to_configured_targets()
+        else:
+            logger.error("[邀请加号] 添加失败(已落盘的 PENDING 账号会在下次自动恢复)")
     finally:
-        flow.stop()
+        if _chatgpt_session_ready(chatgpt):
+            chatgpt.stop()
 
 
 def cmd_admin_login(email=None):
@@ -2508,7 +2823,7 @@ def cmd_main_codex_sync():
 
     saved_auth_file = get_saved_main_auth_file()
     if saved_auth_file:
-        sync_main_codex_to_cpa(saved_auth_file)
+        sync_main_codex_to_configured_targets(saved_auth_file)
         logger.info("[主号 Codex] 已直接同步现有认证文件: %s", saved_auth_file)
         return {"auth_file": saved_auth_file}
 
@@ -2653,7 +2968,7 @@ def cmd_fill(target=5):
                     break
 
         logger.info("[填充] 填充完成")
-        sync_to_cpa()
+        sync_to_configured_targets()
         cmd_status()
 
     finally:
@@ -2755,35 +3070,28 @@ def cmd_cleanup(max_seats=None):
         if inv_result["status"] == 200:
             inv_data = json.loads(inv_result["body"])
             invites = (
-                inv_data if isinstance(inv_data, list) else inv_data.get("invites", inv_data.get("account_invites", []))
+                inv_data
+                if isinstance(inv_data, list)
+                else inv_data.get("items", inv_data.get("invites", inv_data.get("account_invites", [])))
             )
             for inv in invites:
                 inv_email = inv.get("email_address", "").lower()
                 inv_id = inv.get("id")
                 if inv_email in local_emails and inv_id:
-                    del_result = chatgpt._api_fetch("DELETE", f"/backend-api/accounts/{account_id}/invites/{inv_id}")
+                    # PATCH status=cancelled 是当前 OpenAI 取消邀请的方式
+                    del_result = chatgpt._api_fetch(
+                        "PATCH",
+                        f"/backend-api/accounts/{account_id}/invites/{inv_id}",
+                        {"status": "cancelled"},
+                    )
                     if del_result["status"] in (200, 204):
                         logger.info("[清理] 已取消邀请 %s", inv_email)
 
         logger.info("[清理] 清理完成")
-        sync_to_cpa()
+        sync_to_configured_targets()
 
     finally:
         chatgpt.stop()
-
-
-def cmd_pull_cpa():
-    """从 CPA 反向同步认证文件到本地。"""
-    result = sync_from_cpa()
-    logger.info(
-        "[CPA] 拉取完成: 新增文件 %d, 更新文件 %d, 新增账号 %d, 更新账号 %d, 跳过 %d",
-        result.get("downloaded", 0),
-        result.get("updated", 0),
-        result.get("accounts_added", 0),
-        result.get("accounts_updated", 0),
-        result.get("skipped", 0),
-    )
-    return result
 
 
 def main():
@@ -2800,7 +3108,6 @@ def main():
     rotate_p = sub.add_parser("rotate", help="智能轮转（检查额度 → 移出 → 复用旧号 → 万不得已才创建新号）")
     rotate_p.add_argument("target", type=int, nargs="?", default=5, help="目标成员数（默认 5）")
     sub.add_parser("add", help="手动添加一个新账号")
-    sub.add_parser("manual-add", help="手动 OAuth 添加账号（打开链接登录后粘贴回调 URL）")
     admin_login_p = sub.add_parser("admin-login", help="交互式完成管理员主号登录")
     admin_login_p.add_argument("--email", help="管理员邮箱；不传则运行时交互输入")
     admin_session_p = sub.add_parser("admin-session", help="手动输入 session_token 导入管理员登录态")
@@ -2814,7 +3121,6 @@ def main():
     cleanup_p.add_argument("max_seats", type=int, nargs="?", default=None, help="最大席位数")
 
     sub.add_parser("sync", help="手动同步认证文件到已启用远端")
-    sub.add_parser("pull-cpa", help="从 CPA 反向同步认证文件到本地")
 
     api_p = sub.add_parser("api", help="启动 HTTP API 服务器")
     api_p.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
@@ -2847,8 +3153,6 @@ def main():
         cmd_rotate(args.target, force_auth_repair=True)
     elif args.command == "add":
         cmd_add()
-    elif args.command == "manual-add":
-        cmd_manual_add()
     elif args.command == "admin-login":
         cmd_admin_login(args.email)
     elif args.command == "admin-session":
@@ -2860,9 +3164,7 @@ def main():
     elif args.command == "cleanup":
         cmd_cleanup(args.max_seats)
     elif args.command == "sync":
-        sync_to_cpa()
-    elif args.command == "pull-cpa":
-        cmd_pull_cpa()
+        sync_to_configured_targets()
     elif args.command == "api":
         from autoteam.api import start_server
 
