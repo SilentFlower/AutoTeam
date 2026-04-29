@@ -335,12 +335,47 @@ def bootstrap_owner_registry():
 
 ---
 
+## 完全隔离的资产池：独立 JSON 而非状态字段
+
+`§常见错误 5`（"不要新建第二份 JSON"）仍是默认规则。但当三条特征**全部**满足时，**应当**新开独立 JSON：
+
+1. **命令链路互不可见**——"零回归"硬要求，如 `cmd_check / cmd_rotate / cmd_fill / cmd_cleanup` 不得误触发新池流程
+2. **字段集差异显著**——新池字段（如 `team_residue` / `last_quota` / `mail_account_id`）只在新流程消费，混入旧 JSON 增加 schema 噪音
+3. **数据生命周期不同**——新池纯静态用户驱动（无后台轮询），旧池有自动巡检；混在一起会让 `_normalize_record` / 状态机制相互干扰
+
+### 真例：FREE 池 `data/free_accounts.json`（task `04-29-free-account-generator` D2 决策）
+
+```
+data/
+├── accounts.json           # active 池(原)
+└── free_accounts.json      # FREE 池(新增,与 active 池零交集)
+```
+
+**实施约束**：
+
+- 数据层 `load_*/save_*/find_*/add_*/update_*/delete_*` 仿 `accounts.py` 范式，不再造轮子
+- `_normalize_record()` 入库时按 schema 补默认值，避免读取处 `KeyError`
+- 跨池同步模块（如 `sub2api_sync`）参数化数据来源 + **双向并集去重**避免互删，参考 `_collect_managed_targets(source: Literal["pool","free"])` + `_collect_active_status_emails()` 取两边并集
+- PRD 必须显式锁定隔离决策（ADR 形式），不能口头同意
+
+### 反向：什么时候**不**该拆
+
+- 只是"字段干净"或"日志好看" —— 继续合进现有 JSON
+- 命令链路有交集（如新数据需要被 `cmd_cleanup` 处理） —— 加 `pool_kind` 字段更便宜
+- 数据生命周期与旧池一致 —— 拆完徒增维护成本
+
+### 与 `index.md §3 持久化优先合并到现有 JSON` 的关系
+
+`index.md §3` 仍然是首选（默认规则）。本节是**例外条款** —— 三条特征全满足才走拆分。如果只满足一两条，仍合进现有 JSON。
+
+---
+
 ## 常见错误
 
 1. **直接读 `accounts.json`** 不走 `load_accounts()`——会绕过 BOM 容错和空文件兜底。
 2. **新增字段忘了 `.get(default)`**——线上历史账号会爆 `KeyError`。
 3. **存 `datetime.now()` 字符串到 JSON**——要么是 `time.time()` 浮点，要么不存。
 4. **改 `STATUS_*` 常量值**（如 `"active"` → `"ACTIVE"`）——历史 JSON 里全是旧值，会瞬间让所有账号"消失"。
-5. **新建第二份 JSON 文件**（如 `quota.json`）——能合进 `accounts.json` 的字段就合，别拆。
+5. **新建第二份 JSON 文件**（如 `quota.json`）——能合进 `accounts.json` 的字段就合，别拆。**例外见 §"完全隔离的资产池"**——三条特征（命令链路互不可见 / 字段集差异显著 / 生命周期不同）全满足时才走拆分。
 6. **多租户/多账号场景给单文件加 `owner_id` 字段而不拆目录**——见上方"多租户/多账号"章节。
 7. **自动迁移先 move 后备份**——失败时原文件已丢,无法重试;正确顺序是先 copy 备份、最后才 move + 写新索引。

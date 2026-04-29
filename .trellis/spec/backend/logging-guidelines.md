@@ -183,6 +183,62 @@ logger.error("[Codex] Token 交换失败: %d %s", resp.status_code, resp.text[:2
 
 ---
 
+## 日志脱敏 ≠ API 响应脱敏
+
+`§不能写日志的内容` 的红线只约束 `logger.*`，**不**约束 API 响应。两者各自由 PRD 决策驱动：
+
+| 维度 | 默认行为 | 例外 |
+|------|---------|------|
+| 日志（`logger.*`） | password / token / api_key 永远不打 | 无 |
+| API 响应（FastAPI / dict 返回） | password / token / api_key 默认剥离 | **PRD 显式要求暴露**时保留明文 |
+
+### 真例：免费号 list 端点返回明文 password
+
+`/api/free/list` 的 `_sanitize_free_record` **故意保留**明文 password（PRD R3 要求"复制 email + password"）：
+
+```python
+# src/autoteam/api.py
+def _sanitize_free_record(rec):
+    """转 dict 副本。响应包含明文 ``password``(PRD R3),前端切勿写日志/截图。"""
+    return dict(rec)
+```
+
+前端 `web/src/api.js` 同样明示：
+
+```js
+// 响应含明文 password(用于"复制 email+password");前端切勿写日志或截图。
+list: () => request("get", "/api/free/list"),
+```
+
+**对比参考**：active 池的 `_sanitize_account` 在 `api.py` 里**剥离 password** —— 任何"新端点要不要剥"的问题，**先查 PRD 决策**，不要凭"为安全起见"的直觉。
+
+### 强制约定
+
+故意暴露敏感字段时：
+
+1. **后端 docstring 必须**说明"PRD 第 X 条要求 ..."，避免后续重构者下意识剥离
+2. **前端注释必须**警示"切勿写日志 / 截图"
+3. **`_sanitize_*` 包装层不要拿掉** —— 哪怕当前等价 `dict(rec)`，这是未来加字段过滤的扩展点
+
+### 反模式
+
+```python
+# ❌ 直接 return,字段全暴露
+@app.get("/api/x")
+def get_x():
+    return load_x()  # password 也会出去
+
+# ❌ 看着"更安全"的剥离,实际破坏 PRD 要求的功能
+def _sanitize_free_record(rec):
+    rec = dict(rec)
+    rec.pop("password", None)  # 破坏 FreePage 的复制功能
+    return rec
+```
+
+正确做法：先查 PRD；不暴露则 `_sanitize_*` 显式剥离；暴露则 docstring + 前端注释明示。
+
+---
+
 ## 常见错误
 
 1. **写 `logger.info(f"用户 {email} 登录")` 把 PII / 凭据 f-string 进日志**——既丢延迟格式化，又可能泄漏。
