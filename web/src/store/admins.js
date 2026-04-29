@@ -54,13 +54,22 @@ export async function switchAdmin(adminId) {
 
 /**
  * 删除指定 admin（后端会同步清理数据目录），删除后刷新列表。
- * 删除唯一 admin 时后端返回 400，由调用方捕获错误展示。
+ * 删除唯一 admin 时后端返回 400,由调用方捕获错误展示。
+ * 如果删的是当前激活 admin,后端会自动选择另一个 admin 接替激活;
+ * 这里在 refresh 完成后比较前后 currentAdminId,变化时派发切换事件
+ * 让 Workbench 各 tab 重新拉数据,避免显示已删除 admin 的残留状态。
  * @param {string} adminId 待删除 admin_id
  * @return {Promise<void>}
  */
 export async function removeAdmin(adminId) {
+  const before = state.currentAdminId
   await api.deleteAdmin(adminId)
   await refreshAdmins()
+  if (state.currentAdminId !== before) {
+    window.dispatchEvent(
+      new CustomEvent('autoteam:admin-switched', { detail: { adminId: state.currentAdminId } })
+    )
+  }
 }
 
 /**

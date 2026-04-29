@@ -24,11 +24,11 @@
       <div v-else-if="admins.length === 0" class="px-3 py-2 text-sm text-slate-400">还没有任何管理员</div>
 
       <ul v-if="loaded" class="space-y-1 max-h-[60vh] overflow-y-auto">
-        <li v-for="a in admins" :key="a.admin_id">
+        <li v-for="a in admins" :key="a.admin_id" class="group/row relative">
           <button
             @click="onSelect(a)"
             type="button"
-            class="group flex w-full items-start gap-3 rounded-xl px-3 py-2 text-left transition"
+            class="group flex w-full items-start gap-3 rounded-xl px-3 py-2 pr-10 text-left transition"
             :class="a.is_active ? 'bg-blue-500/15 ring-1 ring-blue-400/30' : 'hover:bg-white/5'"
           >
             <span class="mt-0.5 flex h-6 w-6 items-center justify-center rounded-lg text-xs"
@@ -42,8 +42,32 @@
             </span>
             <span v-if="a.is_active" class="text-[10px] text-emerald-300">激活中</span>
           </button>
+          <!--
+            删除按钮放在 li 上而不是放进上面的切换 <button> 内部,
+            避免 button 嵌套 button 造成的 a11y 与 hit-test 问题。
+            悬浮在右侧,hover/focus 时浮现;唯一 admin 时禁用并解释原因。
+          -->
+          <button
+            type="button"
+            @click.stop="onDelete(a)"
+            :disabled="admins.length <= 1 || deleting === a.admin_id"
+            :title="admins.length <= 1
+              ? '系统中只剩一个管理员,无法删除;请先添加其他管理员或登录新账号'
+              : '删除该管理员的凭据与数据目录'"
+            class="absolute right-2 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-lg text-slate-500 transition opacity-0 group-hover/row:opacity-100 focus:opacity-100 hover:bg-red-500/15 hover:text-red-300 disabled:cursor-not-allowed disabled:hover:bg-transparent disabled:hover:text-slate-600 disabled:opacity-30"
+          >
+            <span class="text-sm">{{ deleting === a.admin_id ? '…' : '🗑' }}</span>
+          </button>
         </li>
       </ul>
+
+      <!-- 删除错误提示:展示在下拉底部,避免遮挡列表 -->
+      <div
+        v-if="deleteError"
+        class="mt-2 rounded-xl border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-300"
+      >
+        {{ deleteError }}
+      </div>
 
       <div class="mt-2 border-t border-white/10 pt-2">
         <button
@@ -73,11 +97,13 @@
 import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import { useAdmins } from '../store/admins.js'
 
-const emit = defineEmits(['add-admin', 'switched'])
+const emit = defineEmits(['add-admin', 'switched', 'removed'])
 
-const { state, refreshAdmins, switchAdmin } = useAdmins()
+const { state, refreshAdmins, switchAdmin, removeAdmin } = useAdmins()
 const open = ref(false)
 const rootRef = ref(null)
+const deleting = ref(null)
+const deleteError = ref('')
 
 const admins = computed(() => state.admins)
 const loaded = computed(() => state.loaded)
@@ -105,6 +131,32 @@ async function onSelect(admin) {
 function onAddAdmin() {
   open.value = false
   emit('add-admin')
+}
+
+/**
+ * 删除指定 admin。先用 window.confirm 让用户二次确认（不引入额外组件）;
+ * 删除请求过程中按钮显示 loading 状态。删除唯一 admin 由后端拦截 400,
+ * 这里也通过 disabled 兜底。
+ * @param {object} admin 待删除的 admin 记录
+ */
+async function onDelete(admin) {
+  if (!admin?.admin_id) return
+  if (state.admins.length <= 1) return
+  const label = admin.alias || admin.email || admin.admin_id
+  const confirmed = window.confirm(
+    `确定要删除管理员【${label}】吗?\n\n这会同时清空该主号在 data/admins/${admin.admin_id}/ 下的凭据与账号池数据,无法恢复。`
+  )
+  if (!confirmed) return
+  deleting.value = admin.admin_id
+  deleteError.value = ''
+  try {
+    await removeAdmin(admin.admin_id)
+    emit('removed', { adminId: admin.admin_id })
+  } catch (e) {
+    deleteError.value = e?.message || '删除失败,请稍后再试'
+  } finally {
+    deleting.value = null
+  }
 }
 
 /**
