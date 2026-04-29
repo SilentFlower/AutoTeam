@@ -129,6 +129,10 @@ export const api = {
   startRotate: (target = 5) => request('POST', '/tasks/rotate', { target }),
   startCheck: () => request('POST', '/tasks/check'),
   startAdd: () => request('POST', '/tasks/add'),
+  // 邀请加号：通过母号发邀请 + 自动登录 + Codex OAuth 入池（后台执行）。
+  // 后端路由是否存在视部署版本而定（见 PR4 / 别人未提交工作树），404 时
+  // InviteFlowModal 会原样展示错误。
+  startAddViaInvite: () => request('POST', '/tasks/add-via-invite'),
   startFill: (target = 5) => request('POST', '/tasks/fill', { target }),
   startCleanup: (maxSeats = null) => request('POST', '/tasks/cleanup', { max_seats: maxSeats }),
 

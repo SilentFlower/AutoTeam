@@ -7,7 +7,7 @@
         <span class="text-xs text-slate-500">切换主号后，下方四个 tab 会刷新到该主号上下文</span>
       </div>
       <div class="flex flex-wrap items-center gap-3">
-        <!-- 邀请加号按钮在后续 commit 里接入 -->
+        <InviteActionButton :disabled="!!runningTask" @click="openInvite" />
         <button
           type="button"
           @click="$emit('refresh')"
@@ -99,7 +99,13 @@
       </div>
     </div>
 
-    <!-- modal: 邀请加号顶级入口（在后续 commit 接入 InviteFlowModal） -->
+    <!-- modal: 邀请加号顶级入口 -->
+    <InviteFlowModal
+      v-if="showInviteModal"
+      :running-task="runningTask"
+      @done="onInviteDone"
+      @cancel="closeInvite"
+    />
   </div>
 </template>
 
@@ -123,6 +129,8 @@ import { computed, onMounted, onBeforeUnmount, ref } from 'vue'
 import { useAdmins } from '../store/admins.js'
 import AdminSwitcher from './AdminSwitcher.vue'
 import AdminLoginFlow from './AdminLoginFlow.vue'
+import InviteActionButton from './InviteActionButton.vue'
+import InviteFlowModal from './InviteFlowModal.vue'
 import Dashboard from './Dashboard.vue'
 import TeamMembers from './TeamMembers.vue'
 import PoolPage from './PoolPage.vue'
@@ -154,6 +162,7 @@ const tabs = [
 const currentTab = ref('dashboard')
 
 const showAddAdminModal = ref(false)
+const showInviteModal = ref(false)
 
 function openAddAdmin() {
   showAddAdminModal.value = true
@@ -173,6 +182,20 @@ async function onAdminAdded() {
   }
   emit('refresh')
   showAddAdminModal.value = false
+}
+
+function openInvite() {
+  showInviteModal.value = true
+}
+
+function closeInvite() {
+  showInviteModal.value = false
+}
+
+function onInviteDone() {
+  showInviteModal.value = false
+  emit('refresh')
+  emit('task-started')
 }
 
 function onAdminSwitched() {
