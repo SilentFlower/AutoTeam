@@ -1048,12 +1048,22 @@ def _run_task(task_id: str, func, *args, **kwargs):
 
 
 def _start_task(command: str, func, params: dict, *args, **kwargs) -> dict:
-    """创建并启动后台任务，返回任务信息"""
+    """创建并启动后台任务，返回任务信息
+
+    任务自动关联当前激活 admin_id（从 admin_registry 读),供 GET /api/tasks
+    按 admin 过滤、TaskHistory / LogViewer 区分多 admin 来源。激活 admin 缺失
+    时记 None,前端展示为"-"。
+    """
     if not _playwright_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再试"))
     _playwright_lock.release()
 
     task_id = uuid.uuid4().hex[:12]
+    try:
+        owner_admin_id = admin_registry.get_active_admin_id()
+    except Exception:
+        # admin_registry 自身异常不应阻塞任务创建,退化为 None
+        owner_admin_id = None
     task = {
         "task_id": task_id,
         "command": command,
@@ -1064,6 +1074,7 @@ def _start_task(command: str, func, params: dict, *args, **kwargs) -> dict:
         "finished_at": None,
         "result": None,
         "error": None,
+        "admin_id": owner_admin_id,
     }
     _tasks[task_id] = task
     _prune_tasks()
@@ -2855,10 +2866,17 @@ def post_cleanup(params: CleanupParams = CleanupParams()):
 
 
 @app.get("/api/tasks")
-def get_tasks():
-    """查看所有任务"""
-    sorted_tasks = sorted(_tasks.values(), key=lambda t: t["created_at"], reverse=True)
-    return sorted_tasks
+def get_tasks(admin_id: str | None = None):
+    """查看所有任务
+
+    可选 admin_id query 参数过滤;不传时返回全部任务。前端 TaskHistory 用
+    "仅当前 admin / 全部"切换时透传该参数。"all"视作不过滤(显式语义)。
+    """
+    if admin_id and admin_id != "all":
+        filtered = [t for t in _tasks.values() if t.get("admin_id") == admin_id]
+    else:
+        filtered = list(_tasks.values())
+    return sorted(filtered, key=lambda t: t["created_at"], reverse=True)
 
 
 @app.get("/api/tasks/{task_id}")

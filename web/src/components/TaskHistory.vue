@@ -13,6 +13,7 @@
         <thead>
           <tr class="text-gray-400 text-left border-b border-gray-800">
             <th class="px-4 py-3 font-medium">任务 ID</th>
+            <th class="px-4 py-3 font-medium">主号</th>
             <th class="px-4 py-3 font-medium">命令</th>
             <th class="px-4 py-3 font-medium">参数</th>
             <th class="px-4 py-3 font-medium">状态</th>
@@ -25,6 +26,13 @@
           <tr v-for="task in tasks" :key="task.task_id"
             class="border-b border-gray-800/50 hover:bg-gray-800/30 transition">
             <td class="px-4 py-3 font-mono text-xs text-gray-400">{{ task.task_id }}</td>
+            <td class="px-4 py-3 text-xs">
+              <!-- 优先显示 alias(由父组件传入的映射),退化到 admin_id 短串,再退化到 "-" -->
+              <span v-if="task.admin_id" class="px-2 py-0.5 bg-blue-500/10 text-blue-300 rounded text-xs font-medium">
+                {{ adminAliasMap[task.admin_id] || task.admin_id }}
+              </span>
+              <span v-else class="text-gray-600">-</span>
+            </td>
             <td class="px-4 py-3">
               <span class="px-2 py-0.5 bg-gray-800 rounded text-xs font-medium text-gray-300">
                 {{ task.command }}
@@ -53,6 +61,8 @@
 <script setup>
 defineProps({
   tasks: { type: Array, default: () => [] },
+  // admin_id → alias/email 映射;父组件 TaskHistoryPage 注入。空对象 {} 时回退展示 admin_id。
+  adminAliasMap: { type: Object, default: () => ({}) },
 })
 
 function taskStatusClass(s) {

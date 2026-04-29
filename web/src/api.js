@@ -136,7 +136,13 @@ export const api = {
   startFill: (target = 5) => request('POST', '/tasks/fill', { target }),
   startCleanup: (maxSeats = null) => request('POST', '/tasks/cleanup', { max_seats: maxSeats }),
 
-  getTasks: () => request('GET', '/tasks'),
+  getTasks: (adminId = null) => {
+    // adminId 非空时按 admin 过滤;'all' 视为显式不过滤;null/undefined 也走全部
+    if (adminId && adminId !== 'all') {
+      return request('GET', `/tasks?admin_id=${encodeURIComponent(adminId)}`)
+    }
+    return request('GET', '/tasks')
+  },
   getTask: (id) => request('GET', `/tasks/${id}`),
 
   getAutoCheckConfig: () => request('GET', '/config/auto-check'),
