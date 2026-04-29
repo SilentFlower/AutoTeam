@@ -1,6 +1,7 @@
 """Codex 认证管理 - OAuth 登录、token 管理、保存 CPA 兼容认证文件"""
 
 import base64
+import datetime
 import hashlib
 import json
 import logging
@@ -63,8 +64,19 @@ def _parse_jwt_payload(token):
 
 
 def _screenshot(page, name):
+    """保存截图到 ``screenshots/`` 目录,文件名前自动拼时间戳。
+
+    详见 ``invite.screenshot`` 的注释。这里独立实现一份是为了避免 codex_auth
+    依赖 invite,两个模块各自截各自的就好。截图失败降级为 warning,不影响主流程。
+    """
     SCREENSHOT_DIR.mkdir(exist_ok=True)
-    page.screenshot(path=str(SCREENSHOT_DIR / name), full_page=True)
+    now = datetime.datetime.now()
+    ts = now.strftime("%Y%m%d-%H%M%S-") + f"{now.microsecond // 1000:03d}"
+    path = SCREENSHOT_DIR / f"{ts}_{name}"
+    try:
+        page.screenshot(path=str(path), full_page=True)
+    except Exception as exc:
+        logger.warning("[截图] 保存失败 %s: %s", path, exc)
 
 
 def _page_excerpt(page, limit=240):
@@ -80,8 +92,15 @@ def _classify_oauth_failure(url, body_excerpt=""):
     url = (url or "").lower()
     body = (body_excerpt or "").lower()
 
-    if "add-phone" in url:
-        return "add_phone", "需要手机号验证", False
+    if "add-phone" in url or "phone-verification" in url:
+        # 当 HeroSMS 已启用时,手机号验证视为可重试;否则保持 hard-fail 策略
+        try:
+            from autoteam.hero_sms import is_hero_sms_configured
+
+            phone_retryable = is_hero_sms_configured()
+        except Exception:
+            phone_retryable = False
+        return "add_phone", "需要手机号验证", phone_retryable
     if "verify you are human" in body or "captcha" in body:
         return "human_verification", "命中人机验证", False
     if "unable to load site" in body or "try again later" in body or "status page" in body:
@@ -237,6 +256,12 @@ _OTP_INVALID_HINTS = (
     "验证码已过期",
 )
 
+# 手机号输入框 selector(覆盖 OpenAI 的 react-aria 电话组件)
+_PHONE_INPUT_SELECTORS = (
+    'input[type="tel"], input[name="phone_number"], input[name="phone"], '
+    'input[autocomplete="tel"], input[autocomplete="tel-national"]'
+)
+
 _WORKSPACE_PAGE_HINTS = (
     "choose a workspace",
     "select a workspace",
@@ -283,6 +308,141 @@ def _is_otp_input_visible(page, timeout=500):
         return page.locator(_OTP_INPUT_SELECTORS).first.is_visible(timeout=timeout)
     except Exception:
         return False
+
+
+def _is_phone_verification_page(page):
+    """判断当前页面是否需要手机号(phone-verification / add-phone)。"""
+    url = (page.url or "").lower()
+    if "phone-verification" in url or "add-phone" in url:
+        return True
+    try:
+        return page.locator(_PHONE_INPUT_SELECTORS).first.is_visible(timeout=500)
+    except Exception:
+        return False
+
+
+def _format_phone_for_input(phone: str) -> str:
+    """SMS-Activate 协议返回的号码不含 ``+``,这里补上以便 OpenAI 自动识别国家码。"""
+    phone = (phone or "").strip()
+    if not phone:
+        return ""
+    if phone.startswith("+"):
+        return phone
+    return "+" + phone
+
+
+def _build_curl_session_from_page(
+    page, *, target_origin: str = "https://auth.openai.com"
+) -> tuple[object | None, str, str]:
+    """从 Playwright page 派生一个携带相同 cookies 的 curl_cffi session。
+
+    :returns: ``(session, oai_did, user_agent)``。session 为 None 表示派生失败。
+    """
+    try:
+        from curl_cffi import requests as curl_requests
+    except Exception as exc:  # pragma: no cover - 防御
+        logger.error("[Codex] 无法 import curl_cffi: %s", exc)
+        return None, "", ""
+
+    try:
+        from autoteam.config import get_chatgpt_api_impersonate, get_chatgpt_http_proxy_url
+
+        impersonate = get_chatgpt_api_impersonate()
+    except Exception:
+        impersonate = "chrome136"
+
+    session = curl_requests.Session(impersonate=impersonate)
+
+    proxy_url = ""
+    try:
+        proxy_url = get_chatgpt_http_proxy_url()
+    except Exception:
+        proxy_url = ""
+    if proxy_url:
+        session.proxies = {"http": proxy_url, "https": proxy_url}
+
+    oai_did = ""
+    try:
+        for cookie in page.context.cookies(target_origin):
+            name = cookie.get("name") or ""
+            value = cookie.get("value") or ""
+            domain = cookie.get("domain") or ""
+            path = cookie.get("path") or "/"
+            if not name:
+                continue
+            try:
+                session.cookies.set(name, value, domain=domain, path=path)
+            except Exception:
+                # curl_cffi 对 leading dot 的 domain 敏感, 去掉前导点重试
+                session.cookies.set(name, value, domain=domain.lstrip("."), path=path)
+            if name == "oai-did":
+                oai_did = value
+    except Exception as exc:
+        logger.warning("[Codex] 读取 page cookies 失败: %s", exc)
+        return None, "", ""
+
+    user_agent = ""
+    try:
+        user_agent = page.evaluate("() => navigator.userAgent") or ""
+    except Exception:
+        pass
+
+    return session, oai_did, user_agent
+
+
+def _handle_phone_verification(page, sms_client=None, *, screenshot_prefix="codex_phone"):
+    """通过 HeroSMS 自动完成 OpenAI add-phone 验证。
+
+    实现思路对齐 ``/root/project/codex-phone``:
+    1. 从 Playwright page 派生 curl_cffi session(继承 OAuth cookies)
+    2. 调用 ``hero_sms.handle_add_phone_via_http`` 走 OpenAI HTTP API:
+       send → wait SMS → validate, 期间精准识别号码上限 / VoIP 拒绝 / OTP 错
+    3. 验证成功后 ``page.reload()`` 让 Playwright 看到推进后的页面
+
+    :param page: Playwright page(已经停在 phone-verification / add-phone 页)
+    :param sms_client: 兼容老签名, 实际未使用(走 ``handle_add_phone_via_http``
+        内部会重建 client, 利用进程级号码缓存)
+    :returns: ``("ok", None)`` / ``("no_sms_client", None)`` / ``("failed", reason)``
+    """
+    from autoteam.hero_sms import handle_add_phone_via_http, is_hero_sms_configured
+
+    if not is_hero_sms_configured():
+        return "no_sms_client", None
+
+    _screenshot(page, f"{screenshot_prefix}_00_phone_page.png")
+
+    session, oai_did, user_agent = _build_curl_session_from_page(page)
+    if session is None:
+        return "failed", "无法从 Playwright 派生 HTTP session"
+
+    try:
+        ok = handle_add_phone_via_http(
+            session=session,
+            auth_url="https://auth.openai.com",
+            oai_device_id=oai_did,
+            user_agent=user_agent,
+        )
+    except Exception as exc:
+        logger.error("[Codex] handle_add_phone_via_http 异常: %s", exc)
+        return "failed", f"add-phone HTTP 流程异常: {exc}"
+    finally:
+        try:
+            session.close()
+        except Exception:
+            pass
+
+    if not ok:
+        _screenshot(page, f"{screenshot_prefix}_99_failed.png")
+        return "failed", "HeroSMS 自动接码失败(详见日志)"
+
+    # 验证成功后 reload 让页面前进, OpenAI 通常会在下一次跳转里走出 phone 页
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)
+    except Exception as exc:
+        logger.warning("[Codex] phone 验证成功后 reload 失败: %s", exc)
+    _screenshot(page, f"{screenshot_prefix}_10_after_http_ok.png")
+    return "ok", None
 
 
 def _detect_otp_error(page):
@@ -427,14 +587,25 @@ def _select_team_workspace(page, workspace_name: str) -> bool:
     return False
 
 
-def login_codex_via_browser(email, password, mail_client=None, *, return_result=False):
+def login_codex_via_browser(email, password, mail_client=None, *, return_result=False, sms_client=None):
     """
     通过 Playwright 自动完成 Codex OAuth 登录。
-    mail_client: CloudMailClient 实例，用于自动读取登录验证码。
+    mail_client: CloudMailClient 实例,用于自动读取登录验证码。
+    sms_client:  历史保留参数, 当前不再使用 — 手机号验证已切换为
+                 HTTP API 流程(``hero_sms.handle_add_phone_via_http``),
+                 内部直接读 config.HERO_SMS_API_KEY 判断是否启用。
     返回 auth bundle: {access_token, refresh_token, id_token, account_id, email, plan_type}
     return_result=True 时返回:
       {ok: bool, bundle: dict|None, error_type: str|None, error_detail: str|None, retryable: bool}
     """
+    try:
+        from autoteam.hero_sms import is_hero_sms_configured
+
+        if is_hero_sms_configured():
+            logger.info("[Codex] HeroSMS 已配置, phone-verification 页将走 HTTP 自动接码")
+    except Exception as exc:
+        logger.debug("[Codex] HeroSMS 配置探测失败: %s", exc)
+
     code_verifier, code_challenge = _generate_pkce()
     state = secrets.token_urlsafe(16)
     _used_email_ids: set[int] = set()  # 记录已尝试过的邮件，避免重复提交同一封验证码邮件
@@ -765,6 +936,23 @@ def login_codex_via_browser(email, password, mail_client=None, *, return_result=
                 break
 
             _screenshot(page, f"codex_04_step{step + 1}_before.png")
+
+            # 在任何页面中,如果走到手机号验证页且配置了 HeroSMS,自动接码
+            if _is_phone_verification_page(page):
+                logger.info("[Codex] 检测到手机号验证页 (step %d),尝试 HeroSMS HTTP 自动接码", step + 1)
+                phone_result, phone_reason = _handle_phone_verification(
+                    page,
+                    screenshot_prefix=f"codex_phone_step{step + 1}",
+                )
+                if phone_result == "ok":
+                    time.sleep(3)
+                    continue
+                if phone_result == "no_sms_client":
+                    logger.warning("[Codex] HeroSMS 未配置,跳过自动接码,等待人工介入")
+                    break
+                logger.warning("[Codex] HeroSMS 自动接码失败: %s", phone_reason)
+                # 失败就跳出 step 循环,让外层 _classify_oauth_failure 兜底
+                break
 
             # 在任何页面中，如果有 workspace/组织选择，先选 Team
             try:

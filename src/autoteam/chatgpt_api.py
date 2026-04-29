@@ -1,6 +1,7 @@
 """ChatGPT Team API 客户端 - 通过 Playwright 绕过 Cloudflare 调用内部 API"""
 
 import base64
+import datetime
 import json
 import logging
 import re
@@ -54,6 +55,23 @@ _WORKSPACE_FALLBACK_LABELS = (
 
 def _normalize_workspace_label(text):
     return " ".join((text or "").split()).strip()
+
+
+def _save_screenshot(page, name):
+    """保存调试截图到 ``screenshots/`` 目录,文件名前自动拼到毫秒的时间戳。
+
+    本模块原先若干 ``self.page.screenshot(...)`` 内联调用都会用固定文件名,
+    重复触发会互相覆盖,排查现场时只能看到最后一次。这里统一带时间戳前缀,
+    历次失败现场都能保留下来。截图本身失败时降级 warning,不影响主流程。
+    """
+    SCREENSHOT_DIR.mkdir(exist_ok=True)
+    now = datetime.datetime.now()
+    ts = now.strftime("%Y%m%d-%H%M%S-") + f"{now.microsecond // 1000:03d}"
+    path = SCREENSHOT_DIR / f"{ts}_{name}"
+    try:
+        page.screenshot(path=str(path), full_page=True)
+    except Exception as exc:
+        logger.warning("[截图] 保存失败 %s: %s", path, exc)
 
 
 def _workspace_candidate_kind(text):
@@ -686,7 +704,7 @@ class ChatGPTTeamAPI:
 
         logger.info("[ChatGPT] 检测到 workspace 选择页，开始收集组织候选 | URL=%s", self.page.url)
         try:
-            self.page.screenshot(path=str(SCREENSHOT_DIR / "admin_login_workspace_before_select.png"), full_page=True)
+            _save_screenshot(self.page, "admin_login_workspace_before_select.png")
         except Exception:
             pass
 
@@ -1047,7 +1065,7 @@ class ChatGPTTeamAPI:
         email_input = self._visible_locator_in_frames(self.EMAIL_INPUT_SELECTORS, timeout_ms=15000)
         if not email_input:
             try:
-                self.page.screenshot(path=str(SCREENSHOT_DIR / "admin_login_missing_email.png"), full_page=True)
+                _save_screenshot(self.page, "admin_login_missing_email.png")
             except Exception:
                 pass
             body_excerpt = ""
@@ -1166,7 +1184,7 @@ class ChatGPTTeamAPI:
                 code_input = None
         if not code_input:
             try:
-                self.page.screenshot(path=str(SCREENSHOT_DIR / "admin_login_code_not_found.png"), full_page=True)
+                _save_screenshot(self.page, "admin_login_code_not_found.png")
             except Exception:
                 pass
             logger.error("[ChatGPT] 找不到%s验证码输入框 | URL=%s", actor_label, self.page.url)
@@ -1174,7 +1192,7 @@ class ChatGPTTeamAPI:
 
         logger.info("[ChatGPT] 提交%s验证码前 | URL=%s | code_len=%d", actor_label, self.page.url, len(code))
         try:
-            self.page.screenshot(path=str(SCREENSHOT_DIR / "admin_login_code_before_submit.png"), full_page=True)
+            _save_screenshot(self.page, "admin_login_code_before_submit.png")
         except Exception:
             pass
         code_input.fill(code)
@@ -1182,7 +1200,7 @@ class ChatGPTTeamAPI:
         self._click_auth_button(code_input, ["Continue", "继续", "Verify"])
         time.sleep(8)
         try:
-            self.page.screenshot(path=str(SCREENSHOT_DIR / "admin_login_code_after_submit.png"), full_page=True)
+            _save_screenshot(self.page, "admin_login_code_after_submit.png")
         except Exception:
             pass
         self._log_login_state(f"{actor_label}验证码提交后")
