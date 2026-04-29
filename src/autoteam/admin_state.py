@@ -39,9 +39,19 @@ def _state_file_for(admin_id: str | None) -> Path:
     """根据 admin_id 计算 ``state.json`` 路径。
 
     - ``admin_id`` 非空 → ``data/admins/{admin_id}/state.json``。
-    - ``admin_id`` 为空 → 兜底到模块级 ``STATE_FILE``，保持向后兼容
+    - ``admin_id`` 为空 → 兜底到模块级 ``STATE_FILE``,保持向后兼容
       （未传 admin_id 的旧调用 + monkeypatch 常量的旧测试都不受影响）。
+
+    旧测试常用 ``monkeypatch.setattr(admin_state, "STATE_FILE", tmp_path)``
+    重定向写入。但若机器上已有 active admin,按 admin 维度解析会 **绕过
+    monkeypatch 直接污染 production state.json**(踩过坑:
+    test_admin_state.test_clear_admin_state_keeps_state_file_for_symlink_safety
+    把真实 admin 的 state.json 写成 ``{}``,把用户登出了)。这里只要
+    ``STATE_FILE`` 被显式覆盖到非默认值就尊重它,优先级高于 admin 维度。
     """
+    default_file = PROJECT_ROOT / "state.json"
+    if STATE_FILE != default_file:
+        return STATE_FILE
     if admin_id:
         # 延迟 import 避免循环依赖
         from autoteam.admin_registry import admin_data_dir

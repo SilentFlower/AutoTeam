@@ -53,7 +53,18 @@ def _accounts_file(admin_id: str | None = None) -> Path:
     - admin_id 为空且当前有 active admin → 使用 active admin 的目录。
     - admin_id 为空且无 active admin → 兜底到模块级 ``ACCOUNTS_FILE``
       （兼容旧测试与未迁移部署）。
+
+    旧测试常用 ``monkeypatch.setattr(accounts, "ACCOUNTS_FILE", tmp_path)``
+    重定向写入。但若机器上已经有 active admin (data/admins.json),按 admin
+    维度解析会 **绕过 monkeypatch 直接污染 production 数据**(踩过坑:
+    test_accounts.py 把 owner/ready/later/always@example.com 写进了
+    真实 admin 的 accounts.json)。这里参考 account_ops._resolve_auth_dir
+    的做法,只要 ``ACCOUNTS_FILE`` 被显式覆盖到非默认值就尊重它,优先级
+    高于 admin 维度解析。
     """
+    default_file = PROJECT_ROOT / "accounts.json"
+    if ACCOUNTS_FILE != default_file:
+        return ACCOUNTS_FILE
     resolved = _resolve_admin_id(admin_id)
     if resolved:
         from autoteam.admin_registry import admin_data_dir
