@@ -15,3 +15,12 @@ test.py
 web/node_modules/
 .codex
 .coverage
+
+# Runtime data: 环境变量、admin OAuth tokens、运行时状态、备份等
+# 这些含敏感凭证或本地状态,绝对不进版本库
+data/
+
+# IDE / 工具本地配置
+.idea/
+.playwright-mcp/
+.claude/settings.local.json
