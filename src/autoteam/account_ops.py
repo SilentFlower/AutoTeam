@@ -8,8 +8,10 @@ from autoteam.accounts import find_account, load_accounts, save_accounts
 from autoteam.admin_state import get_chatgpt_account_id
 from autoteam.auth_storage import get_auth_dir
 from autoteam.mail_provider import get_account_mail_account_id, get_account_mail_provider, get_mail_client
-from autoteam.sync_targets import delete_account_from_configured_targets
-from autoteam.sync_targets import sync_to_configured_targets as sync_to_cpa
+from autoteam.sync_targets import (
+    delete_account_from_configured_targets,
+    sync_to_configured_targets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +72,11 @@ def fetch_team_state(chatgpt_api):
 
     invites_resp = chatgpt_api._api_fetch("GET", f"/backend-api/accounts/{account_id}/invites")
     data = _parse_team_api_json(invites_resp, "Team 邀请")
-    invites = data if isinstance(data, list) else data.get("invites", data.get("account_invites", []))
+    # OpenAI 当前返回 {"items": [...], "total": N},早期版本曾用 "invites"/"account_invites";
+    # 这里都兜底,避免新版返回结构导致 invites 全部为空
+    invites = (
+        data if isinstance(data, list) else data.get("items", data.get("invites", data.get("account_invites", [])))
+    )
 
     return members, invites
 
@@ -80,7 +86,7 @@ def delete_managed_account(
     *,
     remove_remote=True,
     remove_cloudmail=True,
-    sync_cpa_after=True,
+    sync_remote_after=True,
     chatgpt_api=None,
     mail_client=None,
     remote_state=None,
@@ -145,9 +151,15 @@ def delete_managed_account(
                 invite_id = inv.get("id")
                 if not invite_id:
                     continue
+                # 取消邀请走 DELETE /backend-api/accounts/{id}/invites (集合端点) +
+                # body {"email_address": "..."}, 这是 OpenAI Team 后台 UI 实际使用的
+                # 接口(通过抓 chatgpt.com/admin 网络流量确认)。
+                # 早先版本曾用 PATCH /invites/{id} {status:cancelled},该接口在 2026/04
+                # 仍然返回 200 {"success":true} 但是 no-op (静默假成功),所以不能再用。
                 result = chatgpt_api._api_fetch(
                     "DELETE",
-                    f"/backend-api/accounts/{account_id}/invites/{invite_id}",
+                    f"/backend-api/accounts/{account_id}/invites",
+                    {"email_address": email_l},
                 )
                 if result["status"] not in (200, 204):
                     raise RuntimeError(f"取消 Team 邀请失败: {email}")
@@ -192,8 +204,8 @@ def delete_managed_account(
                 except Exception as exc:
                     logger.warning("[账号] 删除邮箱提供者账户失败: %s", exc)
 
-        if sync_cpa_after:
-            sync_to_cpa()
+        if sync_remote_after:
+            sync_to_configured_targets()
 
         return cleanup
     finally:

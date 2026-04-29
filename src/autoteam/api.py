@@ -124,9 +124,6 @@ class SetupConfig(BaseModel):
     CF_TEMP_EMAIL_BASE_URL: str = ""
     CF_TEMP_EMAIL_ADMIN_PASSWORD: str = ""
     CF_TEMP_EMAIL_DOMAIN: str = ""
-    SYNC_TARGET_CPA: str | bool = ""
-    CPA_URL: str = "http://127.0.0.1:8317"
-    CPA_KEY: str = ""
     SYNC_TARGET_SUB2API: str | bool = ""
     SUB2API_URL: str = ""
     SUB2API_EMAIL: str = ""
@@ -143,6 +140,16 @@ class SetupConfig(BaseModel):
     SUB2API_OVERWRITE_ACCOUNT_SETTINGS: str | bool = "false"
     PLAYWRIGHT_PROXY_URL: str = ""
     PLAYWRIGHT_PROXY_BYPASS: str = ""
+    HERO_SMS_BASE_URL: str = "https://hero-sms.com/stubs/handler_api.php"
+    HERO_SMS_API_KEY: str = ""
+    HERO_SMS_SERVICE: str = "dr"
+    HERO_SMS_COUNTRY: str = "187"
+    HERO_SMS_OPERATOR: str = ""
+    HERO_SMS_MAX_PRICE: str | int | float = "0"
+    HERO_SMS_HTTP_TIMEOUT: str | int = "30"
+    HERO_SMS_WAIT_SECONDS: str | int = "180"
+    HERO_SMS_PHONE_REUSE_MAX: str | int = "3"
+    HERO_SMS_FORCE_NEW_PHONE: str | bool = "false"
     API_KEY: str = ""
 
 
@@ -156,6 +163,8 @@ _RUNTIME_CONFIG_CLEARABLE_FIELDS = {
     "SUB2API_MODEL_WHITELIST",
     "PLAYWRIGHT_PROXY_URL",
     "PLAYWRIGHT_PROXY_BYPASS",
+    "HERO_SMS_API_KEY",
+    "HERO_SMS_OPERATOR",
 }
 
 _CLOUDMAIL_REQUIRED_KEYS = ("CLOUDMAIL_BASE_URL", "CLOUDMAIL_EMAIL", "CLOUDMAIL_PASSWORD", "CLOUDMAIL_DOMAIN")
@@ -164,9 +173,8 @@ _CF_TEMP_EMAIL_REQUIRED_KEYS = (
     "CF_TEMP_EMAIL_ADMIN_PASSWORD",
     "CF_TEMP_EMAIL_DOMAIN",
 )
-_CPA_REQUIRED_KEYS = ("CPA_URL", "CPA_KEY")
 _SUB2API_REQUIRED_KEYS = ("SUB2API_URL", "SUB2API_EMAIL", "SUB2API_PASSWORD")
-_SYNC_TARGET_TOGGLE_KEYS = ("SYNC_TARGET_CPA", "SYNC_TARGET_SUB2API")
+_SYNC_TARGET_TOGGLE_KEYS = ("SYNC_TARGET_SUB2API",)
 
 _ALL_RUNTIME_ENV_KEYS = [
     "MAIL_PROVIDER",
@@ -178,9 +186,6 @@ _ALL_RUNTIME_ENV_KEYS = [
     "CF_TEMP_EMAIL_ADMIN_PASSWORD",
     "CF_TEMP_EMAIL_DOMAIN",
     "CHATGPT_ACCOUNT_ID",
-    "SYNC_TARGET_CPA",
-    "CPA_URL",
-    "CPA_KEY",
     "SYNC_TARGET_SUB2API",
     "SUB2API_URL",
     "SUB2API_EMAIL",
@@ -206,6 +211,16 @@ _ALL_RUNTIME_ENV_KEYS = [
     "PLAYWRIGHT_PROXY_USERNAME",
     "PLAYWRIGHT_PROXY_PASSWORD",
     "PLAYWRIGHT_PROXY_BYPASS",
+    "HERO_SMS_BASE_URL",
+    "HERO_SMS_API_KEY",
+    "HERO_SMS_SERVICE",
+    "HERO_SMS_COUNTRY",
+    "HERO_SMS_OPERATOR",
+    "HERO_SMS_MAX_PRICE",
+    "HERO_SMS_HTTP_TIMEOUT",
+    "HERO_SMS_WAIT_SECONDS",
+    "HERO_SMS_PHONE_REUSE_MAX",
+    "HERO_SMS_FORCE_NEW_PHONE",
 ]
 _RUNTIME_ENV_BASE = {key: os.environ.get(key) for key in _ALL_RUNTIME_ENV_KEYS}
 _runtime_env_reload_lock = threading.Lock()
@@ -255,8 +270,6 @@ def _runtime_required_keys(env: dict[str, str] | None = None) -> set[str]:
     provider = get_mail_provider_name(env)
     required = set(get_mail_provider_required_keys(provider))
     required.add("API_KEY")
-    if states.get("cpa"):
-        required.update(_CPA_REQUIRED_KEYS)
     if states.get("sub2api"):
         required.update(_SUB2API_REQUIRED_KEYS)
     return required
@@ -300,18 +313,10 @@ def _require_pool_operation_configs(action_label: str):
 
     enabled_targets = get_enabled_sync_targets(env)
     if not enabled_targets:
-        raise HTTPException(
-            status_code=400, detail=f"{action_label} 前请先在配置面板启用至少一个远端同步目标（CPA 或 Sub2API）"
-        )
+        raise HTTPException(status_code=400, detail=f"{action_label} 前请先在配置面板启用 Sub2API 同步目标")
 
     missing = _missing_runtime_configs(
-        [
-            key
-            for target in enabled_targets
-            for key in (
-                _CPA_REQUIRED_KEYS if target == "cpa" else _SUB2API_REQUIRED_KEYS if target == "sub2api" else ()
-            )
-        ],
+        [key for target in enabled_targets for key in (_SUB2API_REQUIRED_KEYS if target == "sub2api" else ())],
         env=env,
     )
     if missing:
@@ -326,28 +331,16 @@ def _require_account_mail_configs(account: dict, action_label: str):
     _require_mail_provider_configs(action_label, provider=provider, env=_current_runtime_env())
 
 
-def _require_cpa_configs(action_label: str):
-    _require_runtime_configs(_CPA_REQUIRED_KEYS, action_label)
-
-
 def _require_sync_target_configs(action_label: str):
     from autoteam.sync_targets import get_enabled_sync_targets
 
     env = _current_runtime_env()
     enabled_targets = get_enabled_sync_targets(env)
     if not enabled_targets:
-        raise HTTPException(
-            status_code=400, detail=f"{action_label} 前请先在配置面板启用至少一个远端同步目标（CPA 或 Sub2API）"
-        )
+        raise HTTPException(status_code=400, detail=f"{action_label} 前请先在配置面板启用 Sub2API 同步目标")
 
     missing = _missing_runtime_configs(
-        [
-            key
-            for target in enabled_targets
-            for key in (
-                _CPA_REQUIRED_KEYS if target == "cpa" else _SUB2API_REQUIRED_KEYS if target == "sub2api" else ()
-            )
-        ],
+        [key for target in enabled_targets for key in (_SUB2API_REQUIRED_KEYS if target == "sub2api" else ())],
         env=env,
     )
     if missing:
@@ -370,10 +363,7 @@ def _collect_config_fields(*, include_values: bool = False, configs=None):
     all_ok = True
     for key, prompt, default, optional in config_items:
         raw_value = env.get(key, "") or os.environ.get(key, "")
-        if key == "SYNC_TARGET_CPA":
-            raw_value = "true" if target_states.get("cpa") else "false"
-            configured = True
-        elif key == "SYNC_TARGET_SUB2API":
+        if key == "SYNC_TARGET_SUB2API":
             raw_value = "true" if target_states.get("sub2api") else "false"
             configured = True
         elif key == "MAIL_PROVIDER":
@@ -409,6 +399,7 @@ def _reload_runtime_config_modules():
         "autoteam.cloudflare_temp_email",
         "autoteam.mail_provider",
         "autoteam.sub2api_sync",
+        "autoteam.hero_sms",
     ):
         try:
             module = importlib.import_module(module_name)
@@ -678,23 +669,19 @@ def _maybe_reload_runtime_config_from_env_file(*, force: bool = False):
 
 def _verify_runtime_integrations(previous_env: dict[str, str | None] | None = None):
     from autoteam.mail_provider import get_mail_provider_name, get_mail_provider_prompt, get_mail_provider_required_keys
-    from autoteam.setup_wizard import _verify_cpa, _verify_mail_provider, _verify_sub2api
+    from autoteam.setup_wizard import _verify_mail_provider, _verify_sub2api
 
     errors = []
     mail_provider = get_mail_provider_name()
     mail_keys = tuple(get_mail_provider_required_keys(mail_provider))
-    cpa_keys = ("CPA_URL", "CPA_KEY")
     sub2api_keys = ("SUB2API_URL", "SUB2API_EMAIL", "SUB2API_PASSWORD")
 
     mail_values = [os.environ.get(key, "") for key in mail_keys]
-    cpa_values = [os.environ.get(key, "") for key in cpa_keys]
     sub2api_values = [os.environ.get(key, "") for key in sub2api_keys]
     sync_states = _effective_sync_target_states()
 
     if mail_keys and all(mail_values) and not _verify_mail_provider(mail_provider):
         errors.append(f"{get_mail_provider_prompt(mail_provider)} 连接失败")
-    if sync_states.get("cpa") and all(cpa_values) and not _verify_cpa():
-        errors.append("CPA 连接失败")
     if sync_states.get("sub2api") and all(sub2api_values) and not _verify_sub2api():
         errors.append("Sub2API 连接失败")
     if errors:
@@ -782,6 +769,109 @@ def get_runtime_config_source():
     """获取 .env 源文件内容。"""
     content, path = _read_runtime_source_text()
     return {"path": path, "content": content}
+
+
+# ---------------------------------------------------------------------------
+# HeroSMS 元数据(供配置面板的"可搜索下拉"使用)
+# ---------------------------------------------------------------------------
+
+
+def _build_hero_sms_client_for_lookup(api_key_override: str | None, base_url_override: str | None):
+    """根据请求参数或当前配置构造一个临时 HeroSmsClient。
+
+    用户在面板里可能还没保存 API Key,所以允许通过 query 参数透传。
+    base_url 同理。其他参数(country/service 等)对元数据查询无影响。
+    """
+    from autoteam import config as runtime_config
+    from autoteam.hero_sms import DEFAULT_BASE_URL, HeroSmsClient
+
+    api_key = (api_key_override or "").strip() or (getattr(runtime_config, "HERO_SMS_API_KEY", "") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="HeroSMS API Key 未配置")
+
+    base_url = (
+        (base_url_override or "").strip()
+        or (getattr(runtime_config, "HERO_SMS_BASE_URL", "") or DEFAULT_BASE_URL).strip()
+        or DEFAULT_BASE_URL
+    )
+
+    # 元数据查询用较短超时,避免阻塞配置面板
+    return HeroSmsClient(api_key=api_key, base_url=base_url, timeout=20)
+
+
+@app.get("/api/hero-sms/countries")
+def get_hero_sms_countries(api_key: str = "", base_url: str = ""):
+    """返回 HeroSMS 国家列表,供前端搜索下拉使用。"""
+    from autoteam.hero_sms import HeroSmsError
+
+    client = _build_hero_sms_client_for_lookup(api_key, base_url)
+    try:
+        countries = client.get_countries()
+    except HeroSmsError as exc:
+        raise HTTPException(status_code=400, detail=f"获取国家列表失败: {exc} ({exc.code})") from exc
+    return {"data": countries}
+
+
+@app.get("/api/hero-sms/services")
+def get_hero_sms_services(country: str = "", lang: str = "cn", api_key: str = "", base_url: str = ""):
+    """返回 HeroSMS 服务列表,可按国家筛选。"""
+    from autoteam.hero_sms import HeroSmsError
+
+    client = _build_hero_sms_client_for_lookup(api_key, base_url)
+    try:
+        services = client.get_services_list(country=country or None, lang=lang or "cn")
+    except HeroSmsError as exc:
+        raise HTTPException(status_code=400, detail=f"获取服务列表失败: {exc} ({exc.code})") from exc
+    return {"data": services}
+
+
+@app.get("/api/hero-sms/availability")
+def get_hero_sms_availability(service: str = "dr", api_key: str = "", base_url: str = "", limit: int = 50):
+    """按服务返回实时可用国家库存,排除 count=0 的国家。
+
+    数据源是 SMS-Activate 协议的 ``getPrices?service=X``,平台会返回每个 country
+    下该 service 的当前库存与单价,这是判断"哪些 country 此刻能买到号"的唯一
+    可靠依据(网站上看到的国家列表只是平台支持的国家,与库存无关)。
+    """
+    from autoteam.hero_sms import HeroSmsError
+
+    client = _build_hero_sms_client_for_lookup(api_key, base_url)
+    try:
+        prices = client.get_prices(service=service)
+    except HeroSmsError as exc:
+        raise HTTPException(status_code=400, detail=f"获取价格失败: {exc} ({exc.code})") from exc
+
+    if not isinstance(prices, dict):
+        raise HTTPException(status_code=502, detail=f"非预期 getPrices 响应: {type(prices).__name__}")
+
+    # 平台返回 {country_id: {service_code: {cost, count}}}
+    rows = []
+    for country_id, services_map in prices.items():
+        if not isinstance(services_map, dict):
+            continue
+        info = services_map.get(service)
+        if not isinstance(info, dict):
+            continue
+        try:
+            count = int(info.get("count", 0) or 0)
+        except (TypeError, ValueError):
+            count = 0
+        try:
+            cost = float(info.get("cost", 0) or 0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        if count <= 0:
+            continue
+        try:
+            cid = int(country_id)
+        except (TypeError, ValueError):
+            cid = country_id
+        rows.append({"country": cid, "count": count, "cost": cost})
+
+    rows.sort(key=lambda row: (-row["count"], row["cost"]))
+    if limit and limit > 0:
+        rows = rows[: int(limit)]
+    return {"data": rows, "service": service, "available_count": len(rows)}
 
 
 @app.put("/api/config/runtime")
@@ -874,7 +964,6 @@ _PENDING_ADMIN_KEY = "__pending__"
 _main_codex_flow = None
 _main_codex_step: str | None = None
 _main_codex_action: str | None = None
-_manual_account_flow = None
 MAX_TASK_HISTORY = 50
 
 
@@ -1119,10 +1208,6 @@ class AdminWorkspaceParams(BaseModel):
     option_id: str
 
 
-class ManualAccountCallbackParams(BaseModel):
-    redirect_url: str
-
-
 class TeamMemberRemoveParams(BaseModel):
     email: str
     user_id: str
@@ -1336,26 +1421,6 @@ def _main_codex_status():
     }
 
 
-def _manual_account_status():
-    status = {
-        "in_progress": False,
-        "status": "idle",
-        "state": "",
-        "auth_url": "",
-        "started_at": None,
-        "message": "",
-        "error": "",
-        "account": None,
-        "callback_received": False,
-        "callback_source": "",
-        "auto_callback_available": False,
-        "auto_callback_error": "",
-    }
-    if _manual_account_flow:
-        status.update(_manual_account_flow.status())
-    return status
-
-
 def _finish_admin_login(completed: dict):
     global _admin_login_api, _admin_login_step, _admin_login_target
     api = _admin_login_api
@@ -1458,16 +1523,6 @@ def _start_main_codex_flow(action="sync"):
     raise RuntimeError(result.get("detail") or "无法识别主号 Codex 登录步骤")
 
 
-def _finish_manual_account_flow(result: dict):
-    return {**result, "manual_account": _manual_account_status()}
-
-
-def _set_pending_manual_account_flow(flow, result):
-    global _manual_account_flow
-    _manual_account_flow = flow
-    return {**result, "manual_account": _manual_account_status()}
-
-
 # ---------------------------------------------------------------------------
 # 同步端点
 # ---------------------------------------------------------------------------
@@ -1483,12 +1538,6 @@ def get_admin_status(admin_id: str | None = Depends(get_current_admin_id)):
 def get_main_codex_status():
     """获取主号 Codex 同步状态。"""
     return _main_codex_status()
-
-
-@app.get("/api/manual-account/status")
-def get_manual_account_status():
-    """获取手动添加账号状态。"""
-    return _manual_account_status()
 
 
 @app.post("/api/admin/login/start")
@@ -2240,75 +2289,6 @@ def post_main_codex_cancel():
     return {"message": "主号 Codex 登录已取消", "codex": _main_codex_status()}
 
 
-@app.post("/api/main-codex/delete-cpa")
-def post_main_codex_delete_cpa():
-    """删除 CPA 中已上传的主号 Codex 认证文件。"""
-    from autoteam.cpa_sync import delete_main_codex_from_cpa
-
-    result = delete_main_codex_from_cpa()
-    return {
-        "message": f"已从 CPA 删除 {result['count']} 个主号认证文件",
-        "deleted": result["deleted"],
-    }
-
-
-@app.post("/api/manual-account/start")
-def post_manual_account_start():
-    """开始手动添加账号流程，返回 OAuth 链接。"""
-    global _manual_account_flow
-
-    if _manual_account_flow:
-        try:
-            _manual_account_flow.stop()
-        except Exception:
-            pass
-        _manual_account_flow = None
-
-    try:
-        from autoteam.manual_account import ManualAccountFlow
-
-        flow = ManualAccountFlow()
-        result = flow.start()
-        return _set_pending_manual_account_flow(flow, result)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        if _manual_account_flow:
-            try:
-                _manual_account_flow.stop()
-            except Exception:
-                pass
-            _manual_account_flow = None
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/api/manual-account/callback")
-def post_manual_account_callback(params: ManualAccountCallbackParams):
-    """提交 OAuth 回调 URL，完成手动添加账号。"""
-    global _manual_account_flow
-    if not _manual_account_flow:
-        raise HTTPException(status_code=409, detail="当前没有等待回调的手动添加账号流程")
-
-    try:
-        result = _manual_account_flow.submit_callback(params.redirect_url)
-        return _finish_manual_account_flow(result)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-
-@app.post("/api/manual-account/cancel")
-def post_manual_account_cancel():
-    """取消手动添加账号流程。"""
-    global _manual_account_flow
-    if _manual_account_flow:
-        try:
-            _manual_account_flow.stop()
-        except Exception:
-            pass
-        _manual_account_flow = None
-    return {"message": "手动添加账号流程已取消", "manual_account": _manual_account_status()}
-
-
 @app.get("/api/accounts")
 def get_accounts(admin_id: str | None = Depends(get_current_admin_id)):
     """获取所有账号列表"""
@@ -2586,17 +2566,6 @@ def post_sync():
     return {"message": f"已同步到 {describe_sync_targets(targets)}", "result": result}
 
 
-@app.post("/api/sync/from-cpa")
-def post_sync_from_cpa():
-    """从 CPA 反向同步认证文件到本地。"""
-    _require_cpa_configs("拉取 CPA")
-
-    from autoteam.cpa_sync import sync_from_cpa
-
-    result = sync_from_cpa()
-    return {"message": "已从 CPA 同步到本地", "result": result}
-
-
 @app.post("/api/sync/accounts")
 def post_sync_accounts(admin_id: str | None = Depends(get_current_admin_id)):
     """从 auths 目录和 Team 成员同步账号到 accounts.json"""
@@ -2651,6 +2620,9 @@ def get_team_members(admin_id: str | None = Depends(get_current_admin_id)):
                             "type": "member",
                         }
                     )
+                # OpenAI 的 /invites 接口对已 cancelled 的邀请会立即从 items 中移除
+                # (DELETE 成功后 GET 不再返回该项),所以这里不再需要按 status 字段过滤。
+                # 但 OpenAI 的 status 字段是整数(2 = pending),不是字符串,留个 sanity 提示。
                 for inv in invites:
                     email = (inv.get("email_address") or inv.get("email") or "").lower()
                     result.append(
@@ -2712,10 +2684,13 @@ def post_team_member_remove(
         def _do_remove_team_member():
             def _remove(chatgpt):
                 if member_type == "invite":
-                    # OpenAI 当前用 PATCH 设置 status=cancelled 来取消邀请;
-                    # 旧的 DELETE /invites/{id} 已经返回 405 Method Not Allowed
-                    path = f"/backend-api/accounts/{account_id}/invites/{user_id}"
-                    result = chatgpt._api_fetch("PATCH", path, {"status": "cancelled"})
+                    # OpenAI 当前的取消邀请接口是: DELETE /backend-api/accounts/{id}/invites
+                    # (集合端点,不带 invite_id), body 里传 {"email_address": "..."} 标识要取消哪条。
+                    # 历史上写过 "PATCH /invites/{id} {status: cancelled}" 是错的: 这个 endpoint
+                    # 永远返回 200 {"success":true} 但实际是 no-op (OpenAI 网关的静默假成功),
+                    # 所以前端表现为「点了没效果」。
+                    path = f"/backend-api/accounts/{account_id}/invites"
+                    result = chatgpt._api_fetch("DELETE", path, {"email_address": email})
                     return result, "取消邀请"
                 path = f"/backend-api/accounts/{account_id}/users/{user_id}"
                 result = chatgpt._api_fetch("DELETE", path)
@@ -2790,16 +2765,6 @@ def post_sync_main_codex():
     return post_main_codex_start()
 
 
-@app.get("/api/cpa/files")
-def get_cpa_files():
-    """获取 CPA 中的认证文件列表"""
-    _require_cpa_configs("查看 CPA 文件")
-
-    from autoteam.cpa_sync import list_cpa_files
-
-    return list_cpa_files()
-
-
 # ---------------------------------------------------------------------------
 # 后台任务端点
 # ---------------------------------------------------------------------------
@@ -2842,6 +2807,17 @@ def post_add():
     from autoteam.manager import cmd_add
 
     task = _start_task("add", cmd_add, {})
+    return task
+
+
+@app.post("/api/tasks/add-via-invite", status_code=202)
+def post_add_via_invite():
+    """通过母号邀请 + 邀请链接登录 + Codex OAuth 添加新账号（后台执行）"""
+    _require_pool_operation_configs("邀请加号")
+
+    from autoteam.manager import cmd_add_via_invite
+
+    task = _start_task("add_via_invite", cmd_add_via_invite, {})
     return task
 
 

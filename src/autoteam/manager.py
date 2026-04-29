@@ -3078,11 +3078,12 @@ def cmd_cleanup(max_seats=None):
                 inv_email = inv.get("email_address", "").lower()
                 inv_id = inv.get("id")
                 if inv_email in local_emails and inv_id:
-                    # PATCH status=cancelled 是当前 OpenAI 取消邀请的方式
+                    # DELETE /backend-api/accounts/{id}/invites + {"email_address":...}
+                    # 详见 api.py 同名接口注释。早期 PATCH {status:cancelled} 是错的(假成功)。
                     del_result = chatgpt._api_fetch(
-                        "PATCH",
-                        f"/backend-api/accounts/{account_id}/invites/{inv_id}",
-                        {"status": "cancelled"},
+                        "DELETE",
+                        f"/backend-api/accounts/{account_id}/invites",
+                        {"email_address": inv_email},
                     )
                     if del_result["status"] in (200, 204):
                         logger.info("[清理] 已取消邀请 %s", inv_email)
