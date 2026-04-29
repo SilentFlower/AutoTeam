@@ -1,7 +1,7 @@
 {
-  "id": "free-account-generator",
-  "name": "free-account-generator",
-  "title": "免费号生成器：邀请进 Team 再移出绕过手机号验证",
+  "id": "sub2api-main-sync-fix",
+  "name": "sub2api-main-sync-fix",
+  "title": "fix: sync_main_codex_to_sub2api 跨主号互删 + 漏代理",
   "description": "",
   "status": "in_progress",
   "dev_type": null,
@@ -18,10 +18,7 @@
   "commit": null,
   "pr_url": null,
   "subtasks": [],
-  "children": [
-    "04-29-codex-auth-try-again",
-    "04-29-free-reauth-after-remove"
-  ],
+  "children": [],
   "parent": null,
   "relatedFiles": [],
   "notes": "",

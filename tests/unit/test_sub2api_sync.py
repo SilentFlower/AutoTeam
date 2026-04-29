@@ -234,11 +234,9 @@ def test_sync_to_sub2api_preserves_existing_manual_settings_when_overwrite_disab
     monkeypatch.setattr(sub2api_sync, "SUB2API_PROXY", "Residential Pool")
     monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
     monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([7], ["Team Pool"]))
-    monkeypatch.setattr(
-        sub2api_sync,
-        "_resolve_proxy_id",
-        lambda token: (_ for _ in ()).throw(AssertionError("proxy should not be resolved without create")),
-    )
+    # 任务 04-29-sub2api-main-sync-fix 顺手对齐 pool 池更新分支也补 proxy_id;
+    # 原本这里 stub 是"更新分支不应解析 proxy",现已变更为"更新也走代理刷新"。
+    monkeypatch.setattr(sub2api_sync, "_resolve_proxy_id", lambda token: 1)
     monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
     monkeypatch.setattr(
         sub2api_sync,
@@ -300,7 +298,9 @@ def test_sync_to_sub2api_preserves_existing_manual_settings_when_overwrite_disab
     assert captured["extra"]["openai_oauth_responses_websockets_v2_enabled"] is True
     assert captured["extra"]["openai_passthrough"] is True
     assert captured["account_settings"] is None
-    assert "proxy_id" not in captured
+    # D2 决定:proxy 不在"账号设置"语义里,即使 OVERWRITE_ACCOUNT_SETTINGS=False
+    # 也按"始终用配置覆盖"语义刷新远端 proxy_id(配置代理改了下次同步立即生效)。
+    assert captured["proxy_id"] == 1
 
 
 def test_sync_to_sub2api_overwrites_managed_settings_when_enabled(monkeypatch, tmp_path):
@@ -314,11 +314,8 @@ def test_sync_to_sub2api_overwrites_managed_settings_when_enabled(monkeypatch, t
     monkeypatch.setattr(sub2api_sync, "SUB2API_MODEL_WHITELIST", "gpt-5.4,gpt-5.4-mini")
     monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
     monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([], []))
-    monkeypatch.setattr(
-        sub2api_sync,
-        "_resolve_proxy_id",
-        lambda token: (_ for _ in ()).throw(AssertionError("proxy should not be resolved without create")),
-    )
+    # 任务 04-29-sub2api-main-sync-fix:更新分支也走代理刷新(D2)。
+    monkeypatch.setattr(sub2api_sync, "_resolve_proxy_id", lambda token: 1)
     monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
     monkeypatch.setattr(
         sub2api_sync,
@@ -500,6 +497,9 @@ def test_sync_main_codex_to_sub2api_creates_account_with_managed_defaults(monkey
     monkeypatch.setattr(sub2api_sync, "SUB2API_OPENAI_PASSTHROUGH", True)
     monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
     monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([7], ["Team Pool"]))
+    # 修复 `04-29-sub2api-main-sync-fix` 后,主号创建分支会调 _resolve_proxy_id;
+    # 用 mock 避免打真实 sub2api `/admin/proxies/all` API。
+    monkeypatch.setattr(sub2api_sync, "_resolve_proxy_id", lambda token: 1)
     monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
     monkeypatch.setattr(sub2api_sync, "_dedupe_managed_accounts", lambda token, items, *, kind: ({}, 0))
 
@@ -536,7 +536,8 @@ def test_sync_main_codex_to_sub2api_creates_account_with_managed_defaults(monkey
     assert captured["extra"]["openai_oauth_responses_websockets_v2_mode"] == "passthrough"
     assert captured["extra"]["openai_oauth_responses_websockets_v2_enabled"] is True
     assert captured["extra"]["openai_passthrough"] is True
-    assert "proxy_id" not in captured
+    # 修复点:主号创建必须带 proxy_id(原断言为 "proxy_id" not in captured,与 pool 池行为不一致)
+    assert captured["proxy_id"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -941,3 +942,261 @@ def test_sync_free_to_sub2api_skips_auth_failed_records(monkeypatch, tmp_path):
     # 半成品被跳过 → 没有任何创建动作
     assert create_calls["n"] == 0
     assert result["created"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 任务 04-29-sub2api-main-sync-fix 回归用例
+# ---------------------------------------------------------------------------
+#
+# 修复两个独立 bug:
+# 1. sync_main_codex_to_sub2api 函数末尾按"主号是单例"假设删跨邮箱主号
+#    (多 admin 共用同一 sub2api 实例时互删主号);
+# 2. 主号同步全程不带代理(创建/更新都没绑 SUB2API_PROXY),与 pool 池行为不一致;
+#    顺手对齐 pool 池更新分支(原本只在创建时绑代理,更新不刷新)。
+
+
+def _build_main_auth_path(tmp_path, email: str) -> "object":
+    """构造一个临时主号 auth 文件路径,具体内容由调用方 monkeypatch 替换。"""
+    auth_path = tmp_path / f"codex-main-{email}.json"
+    auth_path.write_text("{}", encoding="utf-8")
+    return auth_path
+
+
+def test_sync_main_codex_to_sub2api_does_not_delete_other_admins_main(monkeypatch, tmp_path):
+    """AC1:多 admin 共用同一 sub2api 时,A 同步不应删 B 的主号。
+
+    场景:
+    - 远端已存在 ``b@example.com`` (kind=main,id=200) — admin B 的主号;
+    - admin A 同步 ``a@example.com`` 的 auth_file → 触发创建路径;
+    - 期望:_delete_account 不被调用(尤其不能误删 b 的远端记录)。
+
+    回归 bug:历史实现末尾循环把所有 main-kind 但不是当前邮箱的远端账号当
+    "旧主号"删,跨邮箱误删。
+    """
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([], []))
+    monkeypatch.setattr(sub2api_sync, "_resolve_proxy_id", lambda token: None)
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+    # dedup 返回:远端只有 b 这一条 main 账号(没有 a),sync a 时 a 不存在 → 走创建分支
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_dedupe_managed_accounts",
+        lambda token, items, *, kind: (
+            {
+                "b@example.com": {
+                    "id": 200,
+                    "credentials": {},
+                    "extra": {"autoteam_managed": True, "autoteam_kind": "main", "autoteam_email": "b@example.com"},
+                }
+            },
+            0,
+        ),
+    )
+
+    auth_path = _build_main_auth_path(tmp_path, "a@example.com")
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_load_auth_data",
+        lambda path: {"email": "a@example.com", "access_token": "at-a"},
+    )
+    monkeypatch.setattr(sub2api_sync, "_create_account", lambda token, **k: {"id": 999})
+
+    delete_calls = []
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_delete_account",
+        lambda token, account, **kwargs: delete_calls.append(account.get("id")),
+    )
+
+    result = sub2api_sync.sync_main_codex_to_sub2api(str(auth_path))
+
+    # 关键:b 的远端记录(id=200)不应被删
+    assert delete_calls == []
+    assert result["account_id"] == 999
+    # deleted_old 字段保留为空列表,不再承诺"清理旧主号"语义
+    assert result["deleted_old"] == []
+
+
+def test_sync_main_codex_to_sub2api_updates_with_proxy_id(monkeypatch, tmp_path):
+    """AC3:远端已有同邮箱主号时,update 路径要把 proxy_id 写进 payload。"""
+    monkeypatch.setattr(sub2api_sync, "SUB2API_PROXY", "Residential Pool")
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([], []))
+    monkeypatch.setattr(sub2api_sync, "_resolve_proxy_id", lambda token: 1)
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+    # 远端已存在同邮箱主号 → sync 走更新路径
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_dedupe_managed_accounts",
+        lambda token, items, *, kind: (
+            {
+                "main@example.com": {
+                    "id": 555,
+                    "credentials": {},
+                    "extra": {"autoteam_managed": True, "autoteam_kind": "main", "autoteam_email": "main@example.com"},
+                    "group_ids": [],
+                }
+            },
+            0,
+        ),
+    )
+
+    auth_path = _build_main_auth_path(tmp_path, "main@example.com")
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_load_auth_data",
+        lambda path: {"email": "main@example.com", "access_token": "at-1"},
+    )
+
+    captured_update = {}
+
+    def fake_update_account(token, account, **kwargs):
+        captured_update.update(kwargs)
+        captured_update["_account_id"] = account.get("id")
+        return {"id": account.get("id")}
+
+    monkeypatch.setattr(sub2api_sync, "_update_account", fake_update_account)
+    # 创建分支不应被触发,放一个会爆的 stub 以便定位
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_create_account",
+        lambda token, **k: pytest.fail("update 路径不应触发 _create_account"),
+    )
+    monkeypatch.setattr(sub2api_sync, "_delete_account", lambda token, account, **k: None)
+
+    result = sub2api_sync.sync_main_codex_to_sub2api(str(auth_path))
+
+    assert captured_update["_account_id"] == 555
+    assert captured_update["proxy_id"] == 1
+    assert result["account_id"] == 555
+
+
+def test_sync_main_codex_to_sub2api_keeps_dedup_call(monkeypatch, tmp_path):
+    """AC4 回归保护:_dedupe_managed_accounts 仍以 kind="main" 调用。
+
+    历史 dedup 在 sync_main_codex_to_sub2api 入口处按 email key 归集同邮箱重复
+    并保留 id 最大的(``_dedupe_managed_accounts`` 实现见 sub2api_sync.py:286)。
+    本测试守住这个调用合约,防止重构时把 dedup 拆掉,造成同邮箱重复继续累积。
+    """
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([], []))
+    monkeypatch.setattr(sub2api_sync, "_resolve_proxy_id", lambda token: None)
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+
+    dedup_calls = []
+
+    def fake_dedupe(token, items, *, kind):
+        dedup_calls.append(kind)
+        return ({}, 0)
+
+    monkeypatch.setattr(sub2api_sync, "_dedupe_managed_accounts", fake_dedupe)
+
+    auth_path = _build_main_auth_path(tmp_path, "main@example.com")
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_load_auth_data",
+        lambda path: {"email": "main@example.com", "access_token": "at"},
+    )
+    monkeypatch.setattr(sub2api_sync, "_create_account", lambda token, **k: {"id": 1})
+
+    sub2api_sync.sync_main_codex_to_sub2api(str(auth_path))
+
+    # 仅一次,且是 main kind(不是 pool / free)
+    assert dedup_calls == ["main"]
+
+
+def test_sync_to_sub2api_pool_updates_proxy_id_on_existing(monkeypatch, tmp_path):
+    """AC5:pool 池更新分支也应携带 proxy_id(原历史只在创建时绑代理一次)。
+
+    本任务 D2 顺手对齐:配置代理改了下次同步立即生效,不再需要先去 sub2api 后台
+    手动清空。配套行为与 main 同步路径一致。
+    """
+    monkeypatch.setattr(sub2api_sync, "SUB2API_PROXY", "Residential Pool")
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([], []))
+    monkeypatch.setattr(sub2api_sync, "_resolve_proxy_id", lambda token: 1)
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+
+    auth_path = tmp_path / "codex-pool@example.com-team-1.json"
+    auth_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [
+            {
+                "email": "pool@example.com",
+                "status": "active",
+                "auth_file": str(auth_path),
+                "last_quota": None,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_load_auth_data",
+        lambda path: {"email": "pool@example.com", "access_token": "at-pool"},
+    )
+    # 远端已经存在该邮箱账号 → 走更新分支
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_dedupe_managed_accounts",
+        lambda token, items, *, kind: (
+            {
+                "pool@example.com": {
+                    "id": 88,
+                    "credentials": {},
+                    "extra": {"autoteam_managed": True, "autoteam_kind": "pool", "autoteam_email": "pool@example.com"},
+                    "group_ids": [],
+                }
+            },
+            0,
+        ),
+    )
+
+    captured_update = {}
+
+    def fake_update_account(token, account, **kwargs):
+        captured_update.update(kwargs)
+        return {"id": account.get("id")}
+
+    monkeypatch.setattr(sub2api_sync, "_update_account", fake_update_account)
+    monkeypatch.setattr(sub2api_sync, "_delete_account", lambda token, account, **k: None)
+
+    result = sub2api_sync.sync_to_sub2api()
+
+    assert result["updated"] == 1
+    assert captured_update["proxy_id"] == 1
+
+
+def test_sync_main_codex_to_sub2api_skips_proxy_field_when_config_empty(monkeypatch, tmp_path):
+    """AC6:SUB2API_PROXY 配置为空(_resolve_proxy_id 返回 None)时,payload 不写
+    proxy_id 字段——远端原 proxy 保持不变,不主动清空(避免对未确认的 sub2api
+    null 语义做假设,见 PRD D1)。
+    """
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([], []))
+    monkeypatch.setattr(sub2api_sync, "_resolve_proxy_id", lambda token: None)
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+    monkeypatch.setattr(sub2api_sync, "_dedupe_managed_accounts", lambda token, items, *, kind: ({}, 0))
+
+    auth_path = _build_main_auth_path(tmp_path, "main@example.com")
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_load_auth_data",
+        lambda path: {"email": "main@example.com", "access_token": "at"},
+    )
+
+    captured = {}
+
+    def fake_create_account(token, **kwargs):
+        captured.update(kwargs)
+        return {"id": 1}
+
+    monkeypatch.setattr(sub2api_sync, "_create_account", fake_create_account)
+
+    sub2api_sync.sync_main_codex_to_sub2api(str(auth_path))
+
+    # _create_account 仍接收 proxy_id 参数(语义"调用方传入 None"),但内部不写入 payload。
+    # 验证 payload 这一层的语义在另一条针对 _create_account 的 unit 测试已覆盖
+    # (test_create_account_includes_proxy_id_only_when_provided)——这里只断言
+    # sync 主路径会显式传 None,不会绕过 _resolve_proxy_id 的"配置为空"返回值。
+    assert captured["proxy_id"] is None

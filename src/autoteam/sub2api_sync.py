@@ -689,7 +689,19 @@ def _update_account(
     status: str | None = None,
     group_ids: list[int] | None = None,
     account_settings: dict | None = None,
+    proxy_id: int | None = None,
 ):
+    """更新已存在的 sub2api 账号。
+
+    :param proxy_id: 期望绑定的代理 ID。语义对齐 :func:`_create_account`:
+        仅当非 None 时才写入 payload 覆盖远端值;为 None 时不写入字段,远端 proxy
+        保持原样(用于 ``SUB2API_PROXY`` 配置为空的场景,避免对未确认的 sub2api
+        清空语义做假设)。
+
+        本参数 PR(`04-29-sub2api-main-sync-fix`)新增,补齐"配置代理改了下次同步立即
+        生效"的诉求——之前 _update_account 没有 proxy_id 参数,主号 / pool 池更新
+        分支都改不了已存在账号的代理绑定。
+    """
     payload = {"credentials": credentials, "extra": extra}
     if name:
         payload["name"] = name
@@ -697,6 +709,8 @@ def _update_account(
         payload["status"] = status
     if group_ids is not None:
         payload["group_ids"] = list(group_ids)
+    if proxy_id is not None:
+        payload["proxy_id"] = int(proxy_id)
     if account_settings:
         payload.update(account_settings)
     return _request(
@@ -941,6 +955,13 @@ def sync_to_sub2api(source: Literal["pool", "free"] = SOURCE_POOL):
         _attach_group_metadata(desired_extra, group_ids, group_names)
         existing = existing_by_email.get(email)
 
+        # proxy_id lazy 解析:更新 / 创建任一分支首次进入时解析一次,后续循环复用。
+        # 修复 `04-29-sub2api-main-sync-fix`:之前 lazy 触发条件只看创建分支,
+        # 导致更新分支永远拿不到 proxy_id,远端代理永远不会刷新。
+        if not proxy_id_resolved:
+            proxy_id = _resolve_proxy_id(token)
+            proxy_id_resolved = True
+
         if existing:
             merged_credentials = dict(existing.get("credentials") or {})
             merged_credentials.update(desired_credentials)
@@ -959,14 +980,11 @@ def sync_to_sub2api(source: Literal["pool", "free"] = SOURCE_POOL):
                 status="active" if existing.get("status") != "active" else None,
                 group_ids=_merge_group_ids(existing, group_ids),
                 account_settings=account_settings,
+                proxy_id=proxy_id,
             )
             logger.info("[Sub2API] 更新: %s", email)
             updated += 1
             continue
-
-        if not proxy_id_resolved:
-            proxy_id = _resolve_proxy_id(token)
-            proxy_id_resolved = True
 
         _apply_managed_credentials_settings(desired_credentials)
         _apply_managed_extra_settings(desired_extra)
@@ -1025,6 +1043,20 @@ def sync_free_to_sub2api():
 
 
 def sync_main_codex_to_sub2api(filepath):
+    """把单个主号 Codex auth 文件同步到 sub2api(创建或更新)。
+
+    与 :func:`sync_to_sub2api` 的关键差异:
+
+    - 数据源是单个 ``filepath`` 文件(每个 admin 各自管理自己的 ``codex-main-*.json``,
+      见 :func:`autoteam.codex_auth.save_main_auth_file`),不走本地 pool/free JSON;
+    - kind 写 ``main``,与 pool 池 / FREE 池在 sub2api 远端按 ``_EXTRA_KIND`` 区分;
+    - 多 admin 共用同一个 sub2api 实例时,每个 admin 的主号邮箱不同,
+      由 :func:`_dedupe_managed_accounts` 按 email 归集——**不删跨邮箱的他人主号**
+      (修复 `04-29-sub2api-main-sync-fix`:历史实现按"主号是单例"假设把所有
+      非当前邮箱的 main-kind 远端账号当旧主号删,导致 admin A / B 互删主号);
+    - 代理绑定与 pool 池一致:创建 / 更新两条路径都解析 ``SUB2API_PROXY`` 并写入,
+      配置代理改了下次同步立即生效。
+    """
     auth_path = Path(filepath)
     if not auth_path.exists():
         raise FileNotFoundError(f"主号认证文件不存在: {auth_path}")
@@ -1041,6 +1073,8 @@ def sync_main_codex_to_sub2api(filepath):
     _attach_group_metadata(desired_extra, group_ids, group_names)
     name = f"AutoTeam Main | {email}" if email else "AutoTeam Main"
     overwrite_account_settings = SUB2API_OVERWRITE_ACCOUNT_SETTINGS
+    # 主号路径只有一条记录待同步,不需要 lazy flag,直接解析一次复用即可。
+    proxy_id = _resolve_proxy_id(token)
 
     current = existing_by_email.get(email) if email else None
     if current:
@@ -1062,6 +1096,7 @@ def sync_main_codex_to_sub2api(filepath):
             status="active",
             group_ids=_merge_group_ids(current, group_ids),
             account_settings=account_settings,
+            proxy_id=proxy_id,
         )
         account_id = current.get("id")
     else:
@@ -1075,27 +1110,18 @@ def sync_main_codex_to_sub2api(filepath):
             label="创建主号账号",
             group_ids=group_ids,
             account_settings=_build_account_settings(),
+            proxy_id=proxy_id,
         )
         account_id = created.get("id") if isinstance(created, dict) else None
 
-    deleted = []
-    for item in existing_by_email.values():
-        if current and item.get("id") == current.get("id"):
-            continue
-        if email and _managed_email(item) == email:
-            continue
-        _delete_account(token, item, label="删除旧主号账号")
-        deleted.append(item.get("id"))
-
     remote_auth_name = _remote_auth_file_name(auth_path.name)
     logger.info(
-        "[Sub2API] 主号 Codex 已同步: %s (account_id=%s, duplicates=%d, deleted_old=%d)",
+        "[Sub2API] 主号 Codex 已同步: %s (account_id=%s, duplicates=%d)",
         remote_auth_name,
         account_id,
         duplicates_deleted,
-        len(deleted),
     )
-    return {"uploaded": remote_auth_name, "account_id": account_id, "deleted_old": deleted}
+    return {"uploaded": remote_auth_name, "account_id": account_id, "deleted_old": []}
 
 
 def delete_main_codex_from_sub2api():

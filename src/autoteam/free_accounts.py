@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -57,6 +58,12 @@ from typing import Any
 from autoteam.textio import read_text, write_text
 
 logger = logging.getLogger(__name__)
+
+# 单条 FREE 号的 reauth 并发保护:同一 email 同时只允许一次重授权流程,
+# 防止用户狂点「重新登录」按钮在同一账号上起多个 Playwright 会话互相干扰。
+# 入锁失败的请求由调用方(API 层)翻译为 409 Conflict。
+_reauth_in_progress: set[str] = set()
+_reauth_lock = threading.Lock()
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
@@ -408,10 +415,17 @@ def _generate_one_free_account(chatgpt_api_factory, *, admin_id: str | None = No
             _safe_delete_temp_email(mail_client, mail_account_id)
             return None
 
-        # ---- Step B: Codex OAuth(无论成功失败都要 remove + 落库)
-        login_result = _login_codex_with_result(email, password, mail_client=mail_client)
-        bundle = login_result.get("bundle") if isinstance(login_result, dict) else None
-        oauth_ok = bool(login_result and login_result.get("ok") and bundle)
+        # ---- Step B: Codex OAuth(team workspace 准入验证;bundle 仅作 plan==team 检验,不落地)
+        # 注意:Step B 拿到的 bundle 在下一步 remove_from_team 后会被服务端 invalidate,
+        # 写到 auth_file 推 sub2api 必报 401 token_invalidated。所以这里不再用 Step B
+        # 的 bundle 落 auth_file,只用其 ok 判定 Step A 真的进了 Team。
+        login_result_step_b = _login_codex_with_result(email, password, mail_client=mail_client)
+        step_b_ok = bool(login_result_step_b and login_result_step_b.get("ok"))
+        if not step_b_ok:
+            logger.warning(
+                "[免费号] Step B Codex 验证失败,继续走 remove + 落库 auth_failed: %s",
+                email,
+            )
 
         # ---- 立即 remove + 二次确认(无论 Step B 是否成功)
         chatgpt = chatgpt_api_factory()
@@ -433,6 +447,26 @@ def _generate_one_free_account(chatgpt_api_factory, *, admin_id: str | None = No
             except Exception as exc:
                 logger.warning("[免费号] remove 阶段 chatgpt stop 异常: %s", exc)
 
+        # ---- Step C: remove 后再走 OAuth,拿 personal-plan bundle 写 auth_file
+        # Step B bundle 已被 invalidate,这里要重新 OAuth。allow_non_team=True 因为账号
+        # 已不在 Team workspace,plan 必然是 personal — 由 PRD R2 决策。
+        bundle: dict | None = None
+        oauth_ok = False
+        if step_b_ok:
+            login_result_step_c = _login_codex_with_result(
+                email,
+                password,
+                mail_client=mail_client,
+                allow_non_team=True,
+            )
+            bundle = login_result_step_c.get("bundle") if isinstance(login_result_step_c, dict) else None
+            oauth_ok = bool(login_result_step_c and login_result_step_c.get("ok") and bundle)
+            if not oauth_ok:
+                logger.error(
+                    "[免费号] Step C remove 后重授权失败,落库 auth_failed: %s",
+                    email,
+                )
+
         # ---- 落库
         auth_file: str | None = None
         if oauth_ok:
@@ -443,6 +477,10 @@ def _generate_one_free_account(chatgpt_api_factory, *, admin_id: str | None = No
                 logger.error("[免费号] 保存 auth_file 失败,降级为 auth_failed: %s (%s)", email, exc)
                 auth_file = None
                 oauth_ok = False
+
+        # 注意:此处不删临时邮箱 — 落库后(无论成功/失败)都保留 mail_account_id,
+        # 让 reauth_free_account 在 token 失效时能复用同一邮箱拉新 OTP;失败半成品
+        # 也需要邮箱在 UI 手动重试时可用。删邮箱仅出现在 Step A 之前的早期失败路径。
 
         status = FREE_STATUS_ACTIVE if oauth_ok else FREE_STATUS_AUTH_FAILED
         record = {
@@ -546,6 +584,121 @@ def _safe_delete_temp_email(mail_client, mail_account_id) -> None:
         mail_client.delete_account(mail_account_id)
     except Exception as exc:
         logger.warning("[免费号] 删除失败临时邮箱异常: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# 重新授权(reauth)
+# ---------------------------------------------------------------------------
+
+
+def reauth_free_account(email: str, admin_id: str | None = None) -> dict[str, Any]:
+    """对单条已落库 FREE 号触发 Codex OAuth 重授权,覆盖 ``auth_file`` 与状态。
+
+    使用场景:已落库 FREE 号的 token 失效(常见于 remove 后服务端 invalidate、过期)时,
+    用户在 FreePage 点「重新登录」按钮触发本函数。
+
+    流程:
+
+    1. 加并发锁(同 email 只允许一次 reauth 在跑,避免狂点按钮起多个 Playwright 会话)
+    2. 读 record(找不到或缺 password 直接抛 ``RuntimeError``)
+    3. ``mail_client.login()`` 复用 record 邮箱拉 OTP(临时邮箱已失效则失败兜底)
+    4. ``_login_codex_with_result(allow_non_team=True)`` — FREE 号已不在 Team,plan 必然 personal
+    5. 成功 → 覆盖 ``auth_file``、``status=active``、清空 ``last_quota`` /
+       ``last_quota_at`` / ``last_sub2api_synced_at``,然后异步触发 ``sync_free_to_sub2api``
+    6. 失败 → ``status=auth_failed``、``auth_file=None``(沿用现有半成品语义)
+    7. 解锁
+
+    :param email: 目标 FREE 号邮箱
+    :param admin_id: 目标 admin,缺省回退激活 admin
+    :raises RuntimeError: 同 email 已在 reauth 中(由 API 层翻译为 ``409 Conflict``);
+        或找不到记录、缺 password 字段
+    :return: ``{"ok": bool, "email": str, "status": str, "auth_file": str|None,
+        "record": dict|None, "error_detail": str|None}``
+    """
+    from autoteam.codex_auth import save_auth_file
+    from autoteam.mail_provider import get_mail_client
+    from autoteam.manager import _login_codex_with_result
+
+    norm = _normalized_email(email)
+    if not norm:
+        raise RuntimeError(f"无效的邮箱: {email}")
+
+    with _reauth_lock:
+        if norm in _reauth_in_progress:
+            raise RuntimeError(f"该 FREE 号正在重新授权中,请稍候: {email}")
+        _reauth_in_progress.add(norm)
+
+    try:
+        records = load_free(admin_id)
+        record = find_free(records, email)
+        if not record:
+            raise RuntimeError(f"找不到 FREE 号记录: {email}")
+        password = record.get("password") or ""
+        if not password:
+            raise RuntimeError(f"FREE 号缺少密码字段,无法重授权: {email}")
+
+        logger.info("[免费号] 开始重新授权: %s", email)
+
+        mail_client = get_mail_client()
+        mail_client.login()
+
+        login_result = _login_codex_with_result(
+            email,
+            password,
+            mail_client=mail_client,
+            allow_non_team=True,
+        )
+        bundle = login_result.get("bundle") if isinstance(login_result, dict) else None
+        oauth_ok = bool(login_result and login_result.get("ok") and bundle)
+
+        auth_file: str | None = None
+        if oauth_ok:
+            try:
+                auth_file = save_auth_file(bundle, admin_id=admin_id)
+            except Exception as exc:
+                logger.error("[免费号] 重授权后保存 auth_file 失败: %s (%s)", email, exc)
+                auth_file = None
+                oauth_ok = False
+
+        new_status = FREE_STATUS_ACTIVE if oauth_ok else FREE_STATUS_AUTH_FAILED
+        updated = update_free(
+            email,
+            admin_id=admin_id,
+            status=new_status,
+            auth_file=auth_file,
+            last_quota=None,
+            last_quota_at=None,
+            last_sub2api_synced_at=None,
+        )
+        logger.info(
+            "[免费号] 重新授权完成: %s (status=%s)",
+            email,
+            new_status,
+        )
+
+        if oauth_ok:
+            try:
+                from autoteam.sub2api_sync import sync_free_to_sub2api
+
+                sync_free_to_sub2api()
+            except Exception as exc:
+                logger.warning("[免费号] 重授权后 sub2api 同步失败,可手动重试: %s", exc)
+
+        error_detail = None
+        if not oauth_ok and isinstance(login_result, dict):
+            error_detail = login_result.get("error_detail")
+
+        return {
+            "ok": oauth_ok,
+            "email": email,
+            "status": new_status,
+            "auth_file": auth_file,
+            "record": updated,
+            "error_detail": error_detail,
+        }
+    finally:
+        with _reauth_lock:
+            _reauth_in_progress.discard(norm)
 
 
 # ---------------------------------------------------------------------------

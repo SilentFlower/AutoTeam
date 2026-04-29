@@ -138,6 +138,14 @@
                 </button>
                 <button
                   type="button"
+                  @click="reauthOne(rec.email)"
+                  :disabled="!!runningTask || actionEmail === rec.email"
+                  class="px-3 py-1.5 rounded-lg text-xs font-medium border transition bg-amber-600/10 text-amber-400 border-amber-500/30 hover:bg-amber-600/20 disabled:opacity-50"
+                >
+                  {{ actionEmail === rec.email && actionType === 'reauth' ? '提交中...' : '重新登录' }}
+                </button>
+                <button
+                  type="button"
                   @click="removeOne(rec.email)"
                   :disabled="!!runningTask || actionEmail === rec.email"
                   class="px-3 py-1.5 rounded-lg text-xs font-medium border transition bg-rose-600/10 text-rose-400 border-rose-500/30 hover:bg-rose-600/20 disabled:opacity-50"
@@ -309,6 +317,23 @@ async function refreshOne(email) {
   try {
     const task = await api.free.checkQuota([email])
     showMessage(`已提交 ${email} 的额度刷新任务，任务 ID: ${task.task_id}`, 'success')
+  } catch (e) {
+    showMessage(`提交失败: ${e.message}`, 'error')
+  } finally {
+    actionEmail.value = ''
+    actionType.value = ''
+  }
+}
+
+async function reauthOne(email) {
+  // 触发后端 POST /api/free/{email}/reauth 异步任务,完成后由 LogViewer + GET /api/tasks 反馈进度。
+  // 用于 token 失效(remove 后被 invalidate / 过期)的手动恢复;成功后后端自动 sync sub2api。
+  if (props.runningTask) return
+  actionEmail.value = email
+  actionType.value = 'reauth'
+  try {
+    const task = await api.free.reauth(email)
+    showMessage(`已提交 ${email} 的重新授权任务，任务 ID: ${task.task_id}`, 'success')
   } catch (e) {
     showMessage(`提交失败: ${e.message}`, 'error')
   } finally {

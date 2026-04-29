@@ -1,0 +1,10 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "项目快照(Python/FastAPI/JSON 持久化/Vue 前端),所有约定的入口"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "改 free_accounts.py / api.py / FreePage.vue 都要遵循扁平结构铁律"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "free_accounts.json 字段命名/向后兼容/状态枚举(沿用 FREE_STATUS_AUTH_FAILED 而非新增,符合该规范)"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "reauth 失败兜底、并发锁 409 返回、HTTPException 中文 detail 都要按规范"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "[免费号] 前缀、%s 占位、token/密码不入日志(reauth 路径多处涉及 bundle/OTP)"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "ruff/pytest/pre-commit 是硬要求"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "复用 _login_codex_with_result / _safe_remove / get_mail_client / sync_free_to_sub2api,不重复造"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "FreePage(Vue) → /api/free/{email}/reauth(FastAPI) → free_accounts.reauth_free_account → codex_auth/manager 的跨层一致性"}
+{"file": ".trellis/tasks/04-29-free-account-generator/prd.md", "reason": "父任务 PRD,含整体生成流程的 D1-D5 决策、状态机、Out of Scope,本任务在其上做增量"}
+{"file": ".trellis/tasks/04-29-free-reauth-after-remove/prd.md", "reason": "本任务 PRD,Requirements/Acceptance/Technical Approach/PR 切分以此为准"}

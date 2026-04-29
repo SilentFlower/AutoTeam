@@ -356,11 +356,27 @@ def _record_auth_repair_failure(email: str, error_type: str | None = None, error
     return state
 
 
-def _login_codex_with_result(email: str, password: str, *, mail_client=None, max_attempts: int = 3) -> dict:
+def _login_codex_with_result(
+    email: str,
+    password: str,
+    *,
+    mail_client=None,
+    max_attempts: int = 3,
+    allow_non_team: bool = False,
+) -> dict:
+    """
+    封装 ``login_codex_via_browser`` 的重试逻辑,统一返回结构化结果。
+
+    :param allow_non_team: 默认 ``False`` 保留主号路径的 ``plan_type=="team"`` 硬约束;
+        ``True`` 时跳过 plan 校验并透传给底层 OAuth — 用于 FREE 号 remove 后再授权
+        的场景(账号已不在 Team workspace,plan 必然是 personal)。
+    """
     max_attempts = max(1, int(max_attempts))
 
     def _single_attempt() -> dict:
         def _reject_non_team(bundle: dict | None) -> dict | None:
+            if allow_non_team:
+                return None
             if not isinstance(bundle, dict) or not bundle:
                 return None
             plan_type = str(bundle.get("plan_type") or "").lower()
@@ -375,8 +391,16 @@ def _login_codex_with_result(email: str, password: str, *, mail_client=None, max
             }
 
         try:
-            result = login_codex_via_browser(email, password, mail_client=mail_client, return_result=True)
+            result = login_codex_via_browser(
+                email,
+                password,
+                mail_client=mail_client,
+                return_result=True,
+                allow_non_team=allow_non_team,
+            )
         except TypeError:
+            # 兼容老签名:不接受 return_result / allow_non_team 时回落到位置参形态。
+            # 此分支同样不再施加 plan 限制(由 _reject_non_team 内部判断)。
             bundle = login_codex_via_browser(email, password, mail_client=mail_client)
             non_team = _reject_non_team(bundle)
             if non_team:
@@ -2510,10 +2534,7 @@ def _resume_invite_logins(chatgpt_api, mail_client):
     :return: 本轮成功推进到 ACTIVE/AUTH_PENDING 的邮箱列表
     """
     accounts = load_accounts()
-    pending = [
-        a for a in accounts
-        if a.get("status") == STATUS_PENDING and a.get("add_via_invite")
-    ]
+    pending = [a for a in accounts if a.get("status") == STATUS_PENDING and a.get("add_via_invite")]
     if not pending:
         return []
 
@@ -2525,10 +2546,7 @@ def _resume_invite_logins(chatgpt_api, mail_client):
     except Exception as exc:
         logger.warning("[邀请加号] 拉取远端 pending invites 失败,跳过本轮恢复: %s", exc)
         return []
-    remote_invite_emails = {
-        (inv.get("email_address") or inv.get("email") or "").lower()
-        for inv in remote_invites
-    }
+    remote_invite_emails = {(inv.get("email_address") or inv.get("email") or "").lower() for inv in remote_invites}
 
     completed = []
     # 一旦下面的 _run_invite_login_flow 用浏览器,母号会话必须先停;只在第一个候选时停

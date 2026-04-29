@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "提交前自检命令清单(ruff/format/pytest/compileall)"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "检查 reauth 失败/并发 409/邮箱失效兜底是否符合规范"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "审查日志脱敏 — bundle/OTP/password 不入 logger"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "PR 提交标准 + commit message 风格"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "审查是否真的复用了既有函数,而不是另写一套"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "审查前端按钮 → API → 业务函数 → 远端的链路一致性,失败语义在各层一致"}
+{"file": ".trellis/tasks/04-29-free-reauth-after-remove/prd.md", "reason": "Acceptance Criteria 逐条对照"}

@@ -587,13 +587,25 @@ def _select_team_workspace(page, workspace_name: str) -> bool:
     return False
 
 
-def login_codex_via_browser(email, password, mail_client=None, *, return_result=False, sms_client=None):
+def login_codex_via_browser(
+    email,
+    password,
+    mail_client=None,
+    *,
+    return_result=False,
+    sms_client=None,
+    allow_non_team=False,
+):
     """
     通过 Playwright 自动完成 Codex OAuth 登录。
     mail_client: CloudMailClient 实例,用于自动读取登录验证码。
     sms_client:  历史保留参数, 当前不再使用 — 手机号验证已切换为
                  HTTP API 流程(``hero_sms.handle_add_phone_via_http``),
                  内部直接读 config.HERO_SMS_API_KEY 判断是否启用。
+    allow_non_team: 默认 ``False`` 保留主号路径的 Team 工作空间硬约束;
+                 设为 ``True`` 时跳过 ``plan_type == "team"`` 检查,允许
+                 personal plan bundle 通过 — 用于 FREE 号 remove 后再授权
+                 拿可用 token 的场景(remove 让原 team bundle 失效)。
     返回 auth bundle: {access_token, refresh_token, id_token, account_id, email, plan_type}
     return_result=True 时返回:
       {ok: bool, bundle: dict|None, error_type: str|None, error_detail: str|None, retryable: bool}
@@ -1181,7 +1193,10 @@ def login_codex_via_browser(email, password, mail_client=None, *, return_result=
     bundle = _exchange_auth_code(auth_code, code_verifier, fallback_email=email)
     if bundle:
         plan_type = str(bundle.get("plan_type") or "").lower()
-        if plan_type != "team":
+        # allow_non_team=True 时跳过 Team 硬约束:FREE 号 remove 后账号已不在
+        # Team workspace,新 OAuth 拿到的是 personal plan bundle,但 token 本身
+        # 仍可被 sub2api 端正常消费(已在 PRD 验证),所以放行。
+        if plan_type != "team" and not allow_non_team:
             detail = f"登录后 plan={plan_type or 'unknown'}，未进入 Team workspace"
             logger.error("[Codex] OAuth 登录失败: %s", detail)
             if return_result:

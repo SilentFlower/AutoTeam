@@ -242,25 +242,48 @@ def patch_generation_deps(monkeypatch, free_file):
     """通用注入:把生成流程依赖的外部函数全替换成可控 stub。
 
     返回 dict 让用例按需覆盖单个 stub(不返回时使用默认成功路径)。
+
+    `_login_codex_with_result` 在新流程下被调用两次(Step B + Step C):
+
+    - 默认 ``login_results`` 序列提供 [team_bundle, personal_bundle],对应正常路径
+    - 用例若设置 ``state["login_result"]``(非 None),所有调用都返回该 dict
+      (兼容老用例的"全失败/单一返回值"语义)
+    - 否则按 ``login_results`` 顺序返回(超出长度时返回最后一项)
     """
+    default_team_bundle = {
+        "ok": True,
+        "bundle": {
+            "email": "free@example.com",
+            "plan_type": "team",
+            "access_token": "tok-team",
+            "refresh_token": "ref-team",
+            "account_id": "acc-1",
+        },
+    }
+    default_personal_bundle = {
+        "ok": True,
+        "bundle": {
+            "email": "free@example.com",
+            "plan_type": "personal",
+            "access_token": "tok-personal",
+            "refresh_token": "ref-personal",
+            "account_id": "acc-2",
+        },
+    }
+
     state: dict = {
         "mail_client": _FakeMailClient(),
         "chatgpt": _FakeChatGPT(),
         "invite_link": "https://invite.example/link",
         "step_a_result": True,
-        "login_result": {
-            "ok": True,
-            "bundle": {
-                "email": "free@example.com",
-                "plan_type": "team",
-                "access_token": "tok",
-                "refresh_token": "ref",
-                "account_id": "acc-1",
-            },
-        },
+        # 老接口:设非 None 时所有调用都返回它,适合"全部失败"类用例
+        "login_result": None,
+        # 新接口:Step B + Step C 序列返回
+        "login_results": [default_team_bundle, default_personal_bundle],
         "remove_status": "removed",
         "verify_remove": True,
         "auth_file_path": "/tmp/auths/codex-free@example.com-team-abcd1234.json",
+        "login_calls": [],
     }
 
     monkeypatch.setattr(free_accounts, "get_mail_client", lambda: state["mail_client"], raising=False)
@@ -279,7 +302,18 @@ def patch_generation_deps(monkeypatch, free_file):
     monkeypatch.setattr("autoteam.manager.invite_to_team", lambda *_a, **_k: True)
     monkeypatch.setattr(free_accounts, "_fetch_invite_link", lambda *_a, **_k: state["invite_link"])
     monkeypatch.setattr(free_accounts, "_run_invite_login_step_a", lambda *_a, **_k: state["step_a_result"])
-    monkeypatch.setattr("autoteam.manager._login_codex_with_result", lambda *a, **k: state["login_result"])
+
+    def _login(*args, **kwargs):
+        state["login_calls"].append({"args": args, "kwargs": kwargs})
+        if state["login_result"] is not None:
+            return state["login_result"]
+        idx = len(state["login_calls"]) - 1
+        seq = state["login_results"]
+        if idx < len(seq):
+            return seq[idx]
+        return seq[-1] if seq else {"ok": False, "bundle": None}
+
+    monkeypatch.setattr("autoteam.manager._login_codex_with_result", _login)
     monkeypatch.setattr(
         "autoteam.manager.remove_from_team",
         lambda *a, **k: state["remove_status"],
@@ -414,6 +448,206 @@ def test_generate_swallows_create_temp_email_failure(monkeypatch, free_file, pat
     result = free_accounts.cmd_generate_free_account(count=1)
     assert result == []
     assert free_accounts.load_free() == []
+
+
+def test_generate_records_auth_failed_when_step_c_fails(free_file, patch_generation_deps):
+    """Step B 成功 + Step C 重授权失败 → status=auth_failed,auth_file=None。
+
+    PRD R5:Step C 失败 沿用 FREE_STATUS_AUTH_FAILED 状态,不引入新枚举。
+    """
+    patch_generation_deps["login_results"] = [
+        {"ok": True, "bundle": {"plan_type": "team", "email": "free@example.com"}},
+        {"ok": False, "bundle": None, "error_detail": "OAuth 二次授权失败"},
+    ]
+
+    result = free_accounts.cmd_generate_free_account(count=1)
+
+    assert len(result) == 1
+    rec = result[0]
+    assert rec["status"] == free_accounts.FREE_STATUS_AUTH_FAILED
+    assert rec["auth_file"] is None
+
+
+def test_generate_passes_allow_non_team_to_step_c(free_file, patch_generation_deps):
+    """验证 Step C(第二次 _login_codex_with_result)调用带 allow_non_team=True。
+
+    Step B 默认调用不传 allow_non_team(保留主号路径行为);Step C 因为账号已被 remove,
+    plan 必然是 personal,必须放宽 plan check 否则会被 _reject_non_team 拒绝。
+    """
+    free_accounts.cmd_generate_free_account(count=1)
+
+    calls = patch_generation_deps["login_calls"]
+    assert len(calls) == 2, f"应调用两次 _login_codex_with_result(Step B + Step C),实际 {len(calls)} 次"
+    # Step B:不传 allow_non_team(默认 False)
+    assert calls[0]["kwargs"].get("allow_non_team") in (None, False)
+    # Step C:必须传 allow_non_team=True
+    assert calls[1]["kwargs"].get("allow_non_team") is True
+
+
+def test_generate_skips_step_c_when_step_b_fails(free_file, patch_generation_deps):
+    """Step B 失败时不调用 Step C,直接落库 auth_failed。避免在没必要的情况下浪费一次 OAuth。"""
+    patch_generation_deps["login_result"] = {"ok": False, "bundle": None}
+
+    result = free_accounts.cmd_generate_free_account(count=1)
+
+    assert len(result) == 1
+    assert result[0]["status"] == free_accounts.FREE_STATUS_AUTH_FAILED
+    # Step B 失败 → 只调 1 次,Step C 被跳过
+    assert len(patch_generation_deps["login_calls"]) == 1
+
+
+def test_generate_uses_step_c_bundle_for_auth_file(free_file, patch_generation_deps, monkeypatch):
+    """落库的 auth_file 必须基于 Step C(personal)bundle,Step B 的 team bundle 应被丢弃。
+
+    若错误使用 Step B bundle 写 auth_file,推 sub2api 时会拿到已被 invalidate 的 token,
+    回到 401 token_invalidated 的原始 bug。
+    """
+    saved_bundles: list[dict] = []
+
+    def _spy_save(bundle, **_k):
+        saved_bundles.append(bundle)
+        return patch_generation_deps["auth_file_path"]
+
+    monkeypatch.setattr("autoteam.codex_auth.save_auth_file", _spy_save)
+
+    free_accounts.cmd_generate_free_account(count=1)
+
+    assert len(saved_bundles) == 1
+    assert saved_bundles[0]["plan_type"] == "personal", f"应落 Step C personal bundle,实际 {saved_bundles[0]}"
+
+
+# ---------------------------------------------------------------------------
+# reauth_free_account
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def patch_reauth_deps(monkeypatch, free_file):
+    """reauth_free_account 的依赖 stub。"""
+    state: dict = {
+        "mail_client": _FakeMailClient(),
+        "login_result": {
+            "ok": True,
+            "bundle": {
+                "email": "free@example.com",
+                "plan_type": "personal",
+                "access_token": "tok-new",
+                "refresh_token": "ref-new",
+            },
+        },
+        "auth_file_path": "/tmp/auths/codex-free@example.com-personal-deadbeef.json",
+        "login_calls": [],
+        "sync_calls": [],
+    }
+
+    monkeypatch.setattr("autoteam.mail_provider.get_mail_client", lambda *a, **k: state["mail_client"])
+
+    def _login(*args, **kwargs):
+        state["login_calls"].append({"args": args, "kwargs": kwargs})
+        return state["login_result"]
+
+    monkeypatch.setattr("autoteam.manager._login_codex_with_result", _login)
+    monkeypatch.setattr(
+        "autoteam.codex_auth.save_auth_file",
+        lambda bundle, **_k: state["auth_file_path"],
+    )
+    monkeypatch.setattr(
+        "autoteam.sub2api_sync.sync_free_to_sub2api",
+        lambda: state["sync_calls"].append("called"),
+    )
+
+    return state
+
+
+def test_reauth_records_active_when_oauth_succeeds(free_file, patch_reauth_deps):
+    """reauth 成功路径:覆盖 auth_file,status 设回 active,异步触发 sub2api 同步。"""
+    free_accounts.add_free(_make_record(email="free@example.com", status=free_accounts.FREE_STATUS_AUTH_FAILED))
+
+    result = free_accounts.reauth_free_account("free@example.com")
+
+    assert result["ok"] is True
+    assert result["status"] == free_accounts.FREE_STATUS_ACTIVE
+    assert result["auth_file"] == patch_reauth_deps["auth_file_path"]
+
+    # 持久化:status / auth_file 已落盘
+    rec = free_accounts.load_free()[0]
+    assert rec["status"] == free_accounts.FREE_STATUS_ACTIVE
+    assert rec["auth_file"] == patch_reauth_deps["auth_file_path"]
+
+    # 调用一次 OAuth 必须带 allow_non_team=True
+    assert len(patch_reauth_deps["login_calls"]) == 1
+    assert patch_reauth_deps["login_calls"][0]["kwargs"].get("allow_non_team") is True
+
+    # 成功后触发 sub2api 同步
+    assert patch_reauth_deps["sync_calls"] == ["called"]
+
+
+def test_reauth_records_auth_failed_when_oauth_fails(free_file, patch_reauth_deps):
+    """reauth 失败路径:status=auth_failed,auth_file=None,不触发 sub2api 同步。"""
+    patch_reauth_deps["login_result"] = {
+        "ok": False,
+        "bundle": None,
+        "error_detail": "OAuth 失败:邮箱 OTP 超时",
+    }
+
+    free_accounts.add_free(_make_record(email="free@example.com"))
+
+    result = free_accounts.reauth_free_account("free@example.com")
+
+    assert result["ok"] is False
+    assert result["status"] == free_accounts.FREE_STATUS_AUTH_FAILED
+    assert result["auth_file"] is None
+    assert result["error_detail"] == "OAuth 失败:邮箱 OTP 超时"
+
+    rec = free_accounts.load_free()[0]
+    assert rec["status"] == free_accounts.FREE_STATUS_AUTH_FAILED
+    assert rec["auth_file"] is None
+
+    # 失败不触发 sub2api 同步
+    assert patch_reauth_deps["sync_calls"] == []
+
+
+def test_reauth_raises_on_concurrent_same_email(free_file, patch_reauth_deps):
+    """同 email 已在 reauth 中再次触发 → 抛 RuntimeError(由 API 层翻译为 409)。"""
+    free_accounts.add_free(_make_record(email="free@example.com"))
+
+    # 模拟该 email 已在锁集合中
+    free_accounts._reauth_in_progress.add("free@example.com")
+    try:
+        with pytest.raises(RuntimeError, match="正在重新授权中"):
+            free_accounts.reauth_free_account("free@example.com")
+    finally:
+        free_accounts._reauth_in_progress.discard("free@example.com")
+
+
+def test_reauth_raises_when_record_missing(free_file, patch_reauth_deps):
+    """目标 email 不在 free_accounts.json 时 → 抛 RuntimeError。"""
+    with pytest.raises(RuntimeError, match="找不到 FREE 号记录"):
+        free_accounts.reauth_free_account("ghost@example.com")
+
+
+def test_reauth_raises_when_password_missing(free_file, patch_reauth_deps):
+    """record 缺 password 字段 → 抛 RuntimeError(无法走 OAuth)。"""
+    free_accounts.add_free(_make_record(email="free@example.com", password=""))
+
+    with pytest.raises(RuntimeError, match="缺少密码字段"):
+        free_accounts.reauth_free_account("free@example.com")
+
+
+def test_reauth_releases_lock_on_exception(free_file, patch_reauth_deps, monkeypatch):
+    """OAuth 流程内部抛异常时,_reauth_in_progress 必须被释放,允许重试。"""
+
+    def _raise(*_a, **_k):
+        raise RuntimeError("playwright crashed")
+
+    monkeypatch.setattr("autoteam.manager._login_codex_with_result", _raise)
+    free_accounts.add_free(_make_record(email="free@example.com"))
+
+    with pytest.raises(RuntimeError, match="playwright crashed"):
+        free_accounts.reauth_free_account("free@example.com")
+
+    # 锁集合已清空,可重新 reauth
+    assert "free@example.com" not in free_accounts._reauth_in_progress
 
 
 # ---------------------------------------------------------------------------

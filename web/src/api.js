@@ -184,6 +184,10 @@ export const api = {
     checkQuota: (emails = null) => request('POST', '/free/check_quota', { emails }),
     // POST /api/free/sync_sub2api → 同步执行的"FREE → sub2api"手动触发兜底
     syncSub2api: () => request('POST', '/free/sync_sub2api'),
+    // POST /api/free/{email}/reauth → 202 + task_id；异步重新授权 codex OAuth
+    // 触发场景：已落库 FREE 号的 token 失效（remove 后被 invalidate / 过期），
+    // 用户在 FreePage 行操作点「重新登录」救一下。成功后自动 sync sub2api。
+    reauth: (email) => request('POST', `/free/${encodeURIComponent(email)}/reauth`),
     // DELETE /api/free/{email} → 级联删除（auth_file + sub2api + cloudmail + JSON 条目）
     delete: (email) => request('DELETE', `/free/${encodeURIComponent(email)}`),
   },

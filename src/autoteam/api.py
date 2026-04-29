@@ -2996,6 +2996,35 @@ def post_free_sync_sub2api():
         _playwright_lock.release()
 
 
+@app.post("/api/free/{email}/reauth", status_code=202)
+def post_free_reauth(email: str):
+    """对单条已落库 FREE 号触发 Codex OAuth 重新授权(异步任务)。
+
+    使用场景:FREE 号 token 失效(remove 后被服务端 invalidate / 过期等)时,
+    用户在 FreePage 点「重新登录」按钮触发本端点。流程详见
+    :func:`free_accounts.reauth_free_account`。
+
+    成功后会自动覆盖 ``auth_file`` 与 status,并触发一次
+    ``sync_free_to_sub2api`` 把新 bundle 推到远端。
+
+    并发约束:全局任务锁(_playwright_lock)被占 → 409。同 email 已在
+    reauth 中由 ``reauth_free_account`` 内部 ``_reauth_in_progress`` 二次保护。
+
+    返回 202 + 任务对象,前端可轮询 ``GET /api/tasks/{task_id}``。
+    """
+    _require_pool_operation_configs(f"重新授权 FREE 号 {email}")
+
+    from autoteam.free_accounts import reauth_free_account
+
+    task = _start_task(
+        "free_reauth",
+        reauth_free_account,
+        {"email": email},
+        email,
+    )
+    return task
+
+
 @app.delete("/api/free/{email}")
 def delete_free_email(email: str, admin_id: str | None = Depends(get_current_admin_id)):
     """级联删除免费号(本地 auth_file + sub2api 远端 + cloudmail 邮箱 + JSON 条目)。

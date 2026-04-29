@@ -94,7 +94,7 @@ def test_record_auth_repair_failure_uses_auto_check_interval_backoff(monkeypatch
 def test_login_codex_with_result_retries_retryable_failures_within_same_round(monkeypatch):
     attempts = {"count": 0}
 
-    def fake_login(email, password, mail_client=None, return_result=False):
+    def fake_login(email, password, mail_client=None, return_result=False, **_kw):
         assert return_result is True
         attempts["count"] += 1
         if attempts["count"] < 3:
@@ -126,7 +126,7 @@ def test_login_codex_with_result_retries_retryable_failures_within_same_round(mo
 def test_login_codex_with_result_stops_immediately_on_hard_failure(monkeypatch):
     attempts = {"count": 0}
 
-    def fake_login(email, password, mail_client=None, return_result=False):
+    def fake_login(email, password, mail_client=None, return_result=False, **_kw):
         assert return_result is True
         attempts["count"] += 1
         return {
@@ -153,7 +153,7 @@ def test_login_codex_with_result_retries_add_phone_when_hero_sms_configured(monk
     """HeroSMS 启用后 add_phone 应进入本轮重试,而不是立即终止。"""
     attempts = {"count": 0}
 
-    def fake_login(email, password, mail_client=None, return_result=False):
+    def fake_login(email, password, mail_client=None, return_result=False, **_kw):
         assert return_result is True
         attempts["count"] += 1
         if attempts["count"] < 2:
@@ -183,7 +183,7 @@ def test_login_codex_with_result_retries_add_phone_when_hero_sms_configured(monk
 
 
 def test_login_codex_with_result_rejects_non_team_bundle(monkeypatch):
-    def fake_login(email, password, mail_client=None, return_result=False):
+    def fake_login(email, password, mail_client=None, return_result=False, **_kw):
         assert return_result is True
         return {
             "ok": True,
