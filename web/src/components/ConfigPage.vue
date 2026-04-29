@@ -140,6 +140,8 @@
                 v-model="runtimeForm[field.key]"
                 :type="fieldInputType(field.key)"
                 :placeholder="field.default || ''"
+                :autocomplete="fieldAutocomplete(field.key)"
+                :name="`runtime-${field.key}`"
                 class="input-dark"
               />
             </div>
@@ -163,6 +165,8 @@
                 v-model="runtimeForm[field.key]"
                 :type="fieldInputType(field.key)"
                 :placeholder="field.default || ''"
+                :autocomplete="fieldAutocomplete(field.key)"
+                :name="`runtime-${field.key}`"
                 class="input-dark"
               />
             </div>
@@ -212,29 +216,6 @@
           </div>
         </div>
 
-        <div v-if="syncCpaEnabled" class="rounded-2xl border border-white/10 bg-white/5 p-5">
-          <div class="mb-4">
-            <div class="text-sm font-medium text-white">CPA</div>
-            <div class="mt-1 text-xs leading-5 text-slate-400">
-              为已启用的 CPA 远端填写连接地址和管理密钥。
-            </div>
-          </div>
-          <div class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-            <div v-for="field in syncCpaFields" :key="field.key" class="rounded-2xl border border-white/10 bg-slate-950/25 p-4">
-              <label class="mb-2 block text-sm font-medium text-slate-300">
-                {{ field.prompt }}
-                <span v-if="isRuntimeRequired(field)" class="text-red-400">*</span>
-              </label>
-              <input
-                v-model="runtimeForm[field.key]"
-                :type="fieldInputType(field.key)"
-                :placeholder="field.default || ''"
-                class="input-dark"
-              />
-            </div>
-          </div>
-        </div>
-
         <div v-if="syncSub2apiEnabled" class="rounded-2xl border border-white/10 bg-white/5 p-5">
           <div class="mb-4">
             <div class="text-sm font-medium text-white">Sub2API</div>
@@ -255,6 +236,8 @@
                 v-model="runtimeForm[field.key]"
                 :type="fieldInputType(field.key)"
                 :placeholder="field.default || ''"
+                :autocomplete="fieldAutocomplete(field.key)"
+                :name="`runtime-${field.key}`"
                 class="input-dark"
               />
             </div>
@@ -300,14 +283,16 @@
                 :type="fieldInputType(field.key)"
                 :step="fieldInputStep(field.key)"
                 :placeholder="field.default || ''"
+                :autocomplete="fieldAutocomplete(field.key)"
+                :name="`runtime-${field.key}`"
                 class="input-dark"
               />
             </div>
           </div>
         </div>
 
-        <div v-if="!syncCpaEnabled && !syncSub2apiEnabled" class="rounded-2xl border border-white/10 bg-white/5 px-4 py-4 text-sm text-slate-400">
-          当前还没有启用任何远端同步目标。先打开上面的开关，再填写对应远端配置。
+        <div v-if="!syncSub2apiEnabled" class="rounded-2xl border border-white/10 bg-white/5 px-4 py-4 text-sm text-slate-400">
+          当前还没有启用 Sub2API 同步目标。先打开上面的开关，再填写对应远端配置。
         </div>
 
         <div class="flex flex-col gap-3 rounded-2xl border border-white/10 bg-white/5 p-4 lg:flex-row lg:items-center lg:justify-between">
@@ -349,6 +334,8 @@
                 v-model="runtimeForm[field.key]"
                 :type="fieldInputType(field.key)"
                 :placeholder="field.default || ''"
+                :autocomplete="fieldAutocomplete(field.key)"
+                :name="`runtime-${field.key}`"
                 class="input-dark"
               />
             </div>
@@ -358,6 +345,241 @@
         <div class="flex flex-col gap-3 rounded-2xl border border-white/10 bg-white/5 p-4 lg:flex-row lg:items-center lg:justify-between">
           <p class="text-xs leading-6 text-slate-400">
             推荐只在确实需要代理 Playwright 浏览器流量时启用，并配合绕过列表避免本地回调误走代理。
+          </p>
+          <button
+            @click="saveRuntimeConfig"
+            :disabled="runtimeSaving || runtimeLoading"
+            class="btn-primary"
+          >
+            {{ runtimeSaving ? '保存中...' : '保存配置' }}
+          </button>
+        </div>
+      </div>
+
+      <div v-else-if="selectedRuntimeCategory === 'hero_sms'" class="space-y-5">
+        <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <!-- API Key / Base URL / Operator / 数值字段:走普通输入 -->
+          <div
+            v-for="field in heroSmsFields.filter(f => !['HERO_SMS_COUNTRY', 'HERO_SMS_SERVICE'].includes(f.key))"
+            :key="field.key"
+            class="rounded-2xl border border-white/10 bg-white/5 p-4"
+          >
+            <label class="mb-2 block text-sm font-medium text-slate-300">
+              {{ field.prompt }}
+            </label>
+            <input
+              v-model="runtimeForm[field.key]"
+              :type="fieldInputType(field.key)"
+              :placeholder="field.default || ''"
+              :autocomplete="fieldAutocomplete(field.key)"
+              :name="`runtime-${field.key}`"
+              class="input-dark"
+            />
+          </div>
+
+          <!-- 国家:可搜索下拉 + 文本兜底 -->
+          <div class="rounded-2xl border border-white/10 bg-white/5 p-4 md:col-span-2">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <label class="block text-sm font-medium text-slate-300">
+                {{ fieldByKey('HERO_SMS_COUNTRY')?.prompt || '国家' }}
+              </label>
+              <div class="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  class="btn-secondary text-xs"
+                  :disabled="heroSmsCountriesLoading"
+                  @click="loadHeroSmsCountries"
+                >
+                  {{ heroSmsCountriesLoading
+                      ? '加载中...'
+                      : (heroSmsCountries.length ? `刷新国家(已加载 ${heroSmsCountries.length})` : '加载国家列表') }}
+                </button>
+                <button
+                  type="button"
+                  class="btn-secondary text-xs"
+                  :disabled="heroSmsAvailabilityLoading"
+                  @click="loadHeroSmsAvailability"
+                >
+                  {{ heroSmsAvailabilityLoading
+                      ? '查询中...'
+                      : `查 ${runtimeForm.HERO_SMS_SERVICE || 'dr'} 实时号库` }}
+                </button>
+              </div>
+            </div>
+            <div class="mt-3 flex flex-wrap items-center gap-3">
+              <input
+                v-model="runtimeForm.HERO_SMS_COUNTRY"
+                type="text"
+                placeholder="hero-sms 自家国家 ID,187=USA、0=Russia、3=China"
+                autocomplete="off"
+                name="runtime-HERO_SMS_COUNTRY"
+                class="input-dark flex-1 min-w-[180px]"
+              />
+              <button
+                type="button"
+                class="btn-secondary text-xs"
+                :disabled="!heroSmsCountries.length"
+                @click="heroSmsCountryDropdownOpen = !heroSmsCountryDropdownOpen"
+              >
+                {{ heroSmsCountryDropdownOpen ? '收起选择器' : '展开搜索选择器' }}
+              </button>
+            </div>
+            <p v-if="heroSmsCurrentCountryLabel()" class="mt-2 text-xs text-slate-400">
+              当前选择: {{ heroSmsCurrentCountryLabel() }}
+            </p>
+            <p v-if="heroSmsCountriesError" class="mt-2 text-xs text-red-400">
+              {{ heroSmsCountriesError }}
+            </p>
+            <div
+              v-if="heroSmsCountryDropdownOpen && heroSmsCountries.length"
+              class="mt-3 rounded-2xl border border-white/10 bg-slate-950/40 p-3"
+            >
+              <input
+                v-model="heroSmsCountrySearch"
+                type="text"
+                placeholder="按 ID / 中英俄文名搜索"
+                class="input-dark"
+              />
+              <div class="mt-2 max-h-64 overflow-y-auto divide-y divide-white/5">
+                <button
+                  v-for="country in filteredHeroSmsCountries"
+                  :key="country.id"
+                  type="button"
+                  class="flex w-full items-center justify-between gap-3 px-2 py-2 text-left text-sm text-slate-200 hover:bg-white/5"
+                  @click="selectHeroSmsCountry(country)"
+                >
+                  <span class="truncate">{{ country.chn || country.eng || country.rus || `id=${country.id}` }}</span>
+                  <span class="font-mono text-xs text-slate-400">id={{ country.id }}</span>
+                </button>
+                <div v-if="!filteredHeroSmsCountries.length" class="px-2 py-2 text-xs text-slate-500">
+                  没有匹配结果
+                </div>
+              </div>
+            </div>
+
+            <!-- 实时号库面板 -->
+            <div
+              v-if="heroSmsAvailabilityOpen"
+              class="mt-3 rounded-2xl border border-emerald-400/20 bg-emerald-500/5 p-3"
+            >
+              <div class="flex items-center justify-between gap-2">
+                <div class="text-xs text-slate-300">
+                  服务 <span class="font-mono text-emerald-200">{{ heroSmsAvailabilityService }}</span> 当前实时库存
+                  (按数量排序;count=0 已过滤)
+                </div>
+                <button
+                  type="button"
+                  class="text-xs text-slate-400 hover:text-slate-200"
+                  @click="heroSmsAvailabilityOpen = false"
+                >
+                  收起
+                </button>
+              </div>
+              <p v-if="heroSmsAvailabilityError" class="mt-2 text-xs text-red-400">
+                {{ heroSmsAvailabilityError }}
+              </p>
+              <div
+                v-if="heroSmsAvailability.length"
+                class="mt-2 max-h-72 overflow-y-auto divide-y divide-white/5"
+              >
+                <button
+                  v-for="row in heroSmsAvailability"
+                  :key="row.country"
+                  type="button"
+                  class="grid w-full grid-cols-[80px_1fr_auto_auto] items-center gap-3 px-2 py-2 text-left text-sm text-slate-200 hover:bg-white/5"
+                  @click="runtimeForm.HERO_SMS_COUNTRY = String(row.country); heroSmsAvailabilityOpen = false"
+                >
+                  <span class="font-mono text-xs text-slate-400">id={{ row.country }}</span>
+                  <span class="truncate">{{ heroSmsCountryNameById(row.country) || `country=${row.country}` }}</span>
+                  <span class="text-xs text-emerald-200">{{ row.count.toLocaleString() }} 个</span>
+                  <span class="text-xs text-slate-400">${{ row.cost }}</span>
+                </button>
+              </div>
+              <p v-else-if="!heroSmsAvailabilityError" class="mt-2 text-xs text-slate-400">
+                没有可用国家,请稍后再试或换其他服务代码
+              </p>
+              <p class="mt-2 text-[11px] leading-5 text-slate-500">
+                提示:网站上看到的"国家列表"只是平台支持的 200+ 个国家,与号库无关。这里展示的是 SMS-Activate 协议
+                getPrices 的实时数据,只显示当前真有号可买的国家。点击行即可写入"国家"字段。
+              </p>
+            </div>
+          </div>
+
+          <!-- 服务:可搜索下拉 + 文本兜底 -->
+          <div class="rounded-2xl border border-white/10 bg-white/5 p-4 md:col-span-2">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <label class="block text-sm font-medium text-slate-300">
+                {{ fieldByKey('HERO_SMS_SERVICE')?.prompt || '服务' }}
+              </label>
+              <button
+                type="button"
+                class="btn-secondary text-xs"
+                :disabled="heroSmsServicesLoading"
+                @click="loadHeroSmsServices"
+              >
+                {{ heroSmsServicesLoading
+                    ? '加载中...'
+                    : (heroSmsServices.length
+                        ? `刷新列表（已加载 ${heroSmsServices.length}）`
+                        : '从 HeroSMS 加载服务列表') }}
+              </button>
+            </div>
+            <div class="mt-3 flex flex-wrap items-center gap-3">
+              <input
+                v-model="runtimeForm.HERO_SMS_SERVICE"
+                type="text"
+                placeholder="服务代码,hero-sms 上 OpenAI = dr"
+                autocomplete="off"
+                name="runtime-HERO_SMS_SERVICE"
+                class="input-dark flex-1 min-w-[180px]"
+              />
+              <button
+                type="button"
+                class="btn-secondary text-xs"
+                :disabled="!heroSmsServices.length"
+                @click="heroSmsServiceDropdownOpen = !heroSmsServiceDropdownOpen"
+              >
+                {{ heroSmsServiceDropdownOpen ? '收起选择器' : '展开搜索选择器' }}
+              </button>
+            </div>
+            <p v-if="heroSmsCurrentServiceLabel()" class="mt-2 text-xs text-slate-400">
+              当前选择: {{ heroSmsCurrentServiceLabel() }}
+            </p>
+            <p v-if="heroSmsServicesError" class="mt-2 text-xs text-red-400">
+              {{ heroSmsServicesError }}
+            </p>
+            <div
+              v-if="heroSmsServiceDropdownOpen && heroSmsServices.length"
+              class="mt-3 rounded-2xl border border-white/10 bg-slate-950/40 p-3"
+            >
+              <input
+                v-model="heroSmsServiceSearch"
+                type="text"
+                placeholder="按代码或名称搜索(中文已切换)"
+                class="input-dark"
+              />
+              <div class="mt-2 max-h-64 overflow-y-auto divide-y divide-white/5">
+                <button
+                  v-for="service in filteredHeroSmsServices"
+                  :key="service.code"
+                  type="button"
+                  class="flex w-full items-center justify-between gap-3 px-2 py-2 text-left text-sm text-slate-200 hover:bg-white/5"
+                  @click="selectHeroSmsService(service)"
+                >
+                  <span class="truncate">{{ service.name || service.code }}</span>
+                  <span class="font-mono text-xs text-slate-400">{{ service.code }}</span>
+                </button>
+                <div v-if="!filteredHeroSmsServices.length" class="px-2 py-2 text-xs text-slate-500">
+                  没有匹配结果
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex flex-col gap-3 rounded-2xl border border-white/10 bg-white/5 p-4 lg:flex-row lg:items-center lg:justify-between">
+          <p class="text-xs leading-6 text-slate-400">
+            {{ currentRuntimeCategoryMeta?.footer || '保存后立即热加载;清空 API Key 即视为关闭。' }}
           </p>
           <button
             @click="saveRuntimeConfig"
@@ -381,6 +603,8 @@
               v-model="runtimeForm[field.key]"
               :type="fieldInputType(field.key)"
               :placeholder="field.default || ''"
+              :autocomplete="fieldAutocomplete(field.key)"
+              :name="`runtime-${field.key}`"
               class="input-dark"
             />
           </div>
@@ -498,10 +722,7 @@ const emit = defineEmits(['refresh', 'admin-progress'])
 const runtimeCategoryKeys = {
   cloudmail: ['MAIL_PROVIDER', 'CLOUDMAIL_BASE_URL', 'CLOUDMAIL_EMAIL', 'CLOUDMAIL_PASSWORD', 'CLOUDMAIL_DOMAIN', 'CF_TEMP_EMAIL_BASE_URL', 'CF_TEMP_EMAIL_ADMIN_PASSWORD', 'CF_TEMP_EMAIL_DOMAIN'],
   sync: [
-    'SYNC_TARGET_CPA',
     'SYNC_TARGET_SUB2API',
-    'CPA_URL',
-    'CPA_KEY',
     'SUB2API_URL',
     'SUB2API_EMAIL',
     'SUB2API_PASSWORD',
@@ -518,6 +739,18 @@ const runtimeCategoryKeys = {
   ],
   proxy: ['PLAYWRIGHT_PROXY_URL', 'PLAYWRIGHT_PROXY_BYPASS'],
   security: ['API_KEY'],
+  hero_sms: [
+    'HERO_SMS_API_KEY',
+    'HERO_SMS_SERVICE',
+    'HERO_SMS_COUNTRY',
+    'HERO_SMS_OPERATOR',
+    'HERO_SMS_MAX_PRICE',
+    'HERO_SMS_PHONE_REUSE_MAX',
+    'HERO_SMS_FORCE_NEW_PHONE',
+    'HERO_SMS_WAIT_SECONDS',
+    'HERO_SMS_HTTP_TIMEOUT',
+    'HERO_SMS_BASE_URL',
+  ],
 }
 
 const runtimeCategoryMeta = {
@@ -534,7 +767,7 @@ const runtimeCategoryMeta = {
     badge: 'Remote Sync',
     title: '远端同步',
     description: '先选择启用的远端同步目标，再填写对应的连接信息。账号池操作会根据这里的启用状态决定同步到哪些远端。',
-    note: '支持同时启用 CPA 和 Sub2API；界面只显示当前已启用目标的详细配置。',
+    note: '当前仅支持 Sub2API 同步目标；启用并填写对应配置即可。',
   },
   proxy: {
     icon: '🛰️',
@@ -551,11 +784,20 @@ const runtimeCategoryMeta = {
     note: '留空会自动生成新的 API Key；保存后前端会立即切换到新的密钥。',
     footer: '这是控制面板和 API 的入口密钥。修改后会立即生效，并同步刷新当前浏览器里的 API Key。',
   },
+  hero_sms: {
+    icon: '📱',
+    badge: 'SMS Activate',
+    title: '接码服务 (HeroSMS)',
+    description: 'OAuth 流程偶尔会被 OpenAI 推到手机号验证页。配置 HeroSMS 后,登录器会通过 OpenAI 官方 HTTP API 自动完成 add-phone(send → SMS → validate),期间精准识别号码上限/VoIP 拒绝/OTP 错;同一号码在 20 分钟内最多复用 N 次。',
+    note: 'OpenAI 在 hero-sms 上的服务代码是 dr(默认值);国家 ID 是 hero-sms 自家编号,与 SMS-Activate 标准不同(187=USA、0=Russia、3=China)。可点"加载列表"搜索具体国家。',
+    footer: '保存后立即热加载;清空 API Key 即视为关闭。',
+  },
 }
 
 const visualCategories = [
   { key: 'cloudmail', label: '邮箱服务', icon: '📧' },
   { key: 'sync', label: '远端同步', icon: '☁️' },
+  { key: 'hero_sms', label: '接码服务', icon: '📱' },
   { key: 'security', label: '安全 / 访问控制', icon: '🔐' },
   { key: 'admin', label: '管理员 / 主号', icon: '👤' },
   { key: 'auto-check', label: '巡检设置', icon: '🔄' },
@@ -617,14 +859,187 @@ function fieldsByKeys(keys) {
 
 const securityFields = computed(() => fieldsByKeys(runtimeCategoryKeys.security))
 const proxyFields = computed(() => fieldsByKeys(runtimeCategoryKeys.proxy))
-const syncToggleFields = computed(() => fieldsByKeys(['SYNC_TARGET_CPA', 'SYNC_TARGET_SUB2API']))
+const heroSmsFields = computed(() => fieldsByKeys(runtimeCategoryKeys.hero_sms))
+const heroSmsApiKeyConfigured = computed(() => Boolean(String(runtimeForm.HERO_SMS_API_KEY || '').trim()))
+
+// HeroSMS 元数据(国家/服务)的远端缓存与搜索状态。在面板内做"可搜索下拉",
+// 同时保留输入框允许用户手填官网新增的国家/服务码。
+const heroSmsCountries = ref([])
+const heroSmsCountriesLoading = ref(false)
+const heroSmsCountriesError = ref('')
+const heroSmsCountrySearch = ref('')
+const heroSmsCountryDropdownOpen = ref(false)
+
+const heroSmsServices = ref([])
+const heroSmsServicesLoading = ref(false)
+const heroSmsServicesError = ref('')
+const heroSmsServiceSearch = ref('')
+const heroSmsServiceDropdownOpen = ref(false)
+
+// 实时按服务查可用国家(走 SMS-Activate getPrices)。这是唯一可靠的"哪些国家此刻有号"
+// 数据来源,网站上看到的国家列表只是平台支持的国家,跟库存无关。
+const heroSmsAvailability = ref([])
+const heroSmsAvailabilityLoading = ref(false)
+const heroSmsAvailabilityError = ref('')
+const heroSmsAvailabilityOpen = ref(false)
+const heroSmsAvailabilityService = ref('')
+
+function _normalizeText(value) {
+  return String(value ?? '').toLowerCase()
+}
+
+const filteredHeroSmsCountries = computed(() => {
+  const q = _normalizeText(heroSmsCountrySearch.value).trim()
+  const all = heroSmsCountries.value
+  if (!q) return all.slice(0, 200)
+  return all.filter((c) => {
+    const idText = String(c.id ?? '')
+    return (
+      idText === q ||
+      idText.includes(q) ||
+      _normalizeText(c.eng).includes(q) ||
+      _normalizeText(c.rus).includes(q) ||
+      _normalizeText(c.chn).includes(q)
+    )
+  }).slice(0, 200)
+})
+
+const filteredHeroSmsServices = computed(() => {
+  const q = _normalizeText(heroSmsServiceSearch.value).trim()
+  const all = heroSmsServices.value
+  if (!q) return all.slice(0, 200)
+  return all.filter((s) => {
+    return (
+      _normalizeText(s.code).includes(q) ||
+      _normalizeText(s.name).includes(q)
+    )
+  }).slice(0, 200)
+})
+
+function heroSmsCountryLabel(country) {
+  if (!country) return ''
+  const name = country.chn || country.eng || country.rus || ''
+  return name ? `${name} (id=${country.id})` : `id=${country.id}`
+}
+
+function heroSmsCurrentCountryLabel() {
+  const id = String(runtimeForm.HERO_SMS_COUNTRY ?? '').trim()
+  if (!id) return ''
+  const matched = heroSmsCountries.value.find((c) => String(c.id) === id)
+  return matched ? heroSmsCountryLabel(matched) : ''
+}
+
+function heroSmsServiceLabel(service) {
+  if (!service) return ''
+  return service.name ? `${service.name} (${service.code})` : service.code
+}
+
+function heroSmsCurrentServiceLabel() {
+  const code = String(runtimeForm.HERO_SMS_SERVICE ?? '').trim().toLowerCase()
+  if (!code) return ''
+  const matched = heroSmsServices.value.find((s) => String(s.code).toLowerCase() === code)
+  return matched ? heroSmsServiceLabel(matched) : ''
+}
+
+async function loadHeroSmsCountries() {
+  heroSmsCountriesError.value = ''
+  heroSmsCountriesLoading.value = true
+  try {
+    const payload = {
+      apiKey: String(runtimeForm.HERO_SMS_API_KEY || '').trim(),
+      baseUrl: String(runtimeForm.HERO_SMS_BASE_URL || '').trim(),
+    }
+    const resp = await api.getHeroSmsCountries(payload)
+    const list = Array.isArray(resp?.data) ? resp.data : []
+    // 平台返回 visible=0 的国家通常代表停售;过滤掉避免误选
+    heroSmsCountries.value = list.filter((c) => c && c.visible !== 0)
+    if (!heroSmsCountries.value.length) {
+      heroSmsCountriesError.value = '平台未返回国家数据'
+    }
+  } catch (err) {
+    heroSmsCountriesError.value = err?.message || '加载国家列表失败'
+    heroSmsCountries.value = []
+  } finally {
+    heroSmsCountriesLoading.value = false
+  }
+}
+
+async function loadHeroSmsServices() {
+  heroSmsServicesError.value = ''
+  heroSmsServicesLoading.value = true
+  try {
+    const payload = {
+      apiKey: String(runtimeForm.HERO_SMS_API_KEY || '').trim(),
+      baseUrl: String(runtimeForm.HERO_SMS_BASE_URL || '').trim(),
+      country: String(runtimeForm.HERO_SMS_COUNTRY || '').trim(),
+      lang: 'cn',
+    }
+    const resp = await api.getHeroSmsServices(payload)
+    const list = Array.isArray(resp?.data) ? resp.data : []
+    heroSmsServices.value = list
+    if (!list.length) {
+      heroSmsServicesError.value = '平台未返回服务数据'
+    }
+  } catch (err) {
+    heroSmsServicesError.value = err?.message || '加载服务列表失败'
+    heroSmsServices.value = []
+  } finally {
+    heroSmsServicesLoading.value = false
+  }
+}
+
+async function loadHeroSmsAvailability() {
+  heroSmsAvailabilityError.value = ''
+  heroSmsAvailabilityLoading.value = true
+  try {
+    const service = String(runtimeForm.HERO_SMS_SERVICE || 'dr').trim() || 'dr'
+    const payload = {
+      apiKey: String(runtimeForm.HERO_SMS_API_KEY || '').trim(),
+      baseUrl: String(runtimeForm.HERO_SMS_BASE_URL || '').trim(),
+      service,
+      limit: 50,
+    }
+    const resp = await api.getHeroSmsAvailability(payload)
+    heroSmsAvailability.value = Array.isArray(resp?.data) ? resp.data : []
+    heroSmsAvailabilityService.value = service
+    heroSmsAvailabilityOpen.value = true
+    if (!heroSmsAvailability.value.length) {
+      heroSmsAvailabilityError.value = `服务 ${service} 当前在所有国家都没有库存(NO_NUMBERS)`
+    }
+  } catch (err) {
+    heroSmsAvailabilityError.value = err?.message || '查询实时号库失败'
+    heroSmsAvailability.value = []
+  } finally {
+    heroSmsAvailabilityLoading.value = false
+  }
+}
+
+function heroSmsCountryNameById(id) {
+  if (id === undefined || id === null) return ''
+  const matched = heroSmsCountries.value.find((c) => String(c.id) === String(id))
+  if (!matched) return ''
+  return matched.chn || matched.eng || matched.rus || `id=${id}`
+}
+
+function selectHeroSmsCountry(country) {
+  if (!country) return
+  runtimeForm.HERO_SMS_COUNTRY = String(country.id)
+  heroSmsCountrySearch.value = ''
+  heroSmsCountryDropdownOpen.value = false
+}
+
+function selectHeroSmsService(service) {
+  if (!service) return
+  runtimeForm.HERO_SMS_SERVICE = String(service.code)
+  heroSmsServiceSearch.value = ''
+  heroSmsServiceDropdownOpen.value = false
+}
+const syncToggleFields = computed(() => fieldsByKeys(['SYNC_TARGET_SUB2API']))
 const selectedMailProvider = computed(() => String(runtimeForm.MAIL_PROVIDER || 'cloudmail').toLowerCase() === 'cloudflare_temp_email' ? 'cloudflare_temp_email' : 'cloudmail')
 const cloudmailProviderFields = computed(() => fieldsByKeys(['CLOUDMAIL_BASE_URL', 'CLOUDMAIL_EMAIL', 'CLOUDMAIL_PASSWORD', 'CLOUDMAIL_DOMAIN']))
 const cfTempEmailFields = computed(() => fieldsByKeys(['CF_TEMP_EMAIL_BASE_URL', 'CF_TEMP_EMAIL_ADMIN_PASSWORD', 'CF_TEMP_EMAIL_DOMAIN']))
 
-const syncCpaEnabled = computed(() => String(runtimeForm.SYNC_TARGET_CPA || '').toLowerCase() === 'true')
 const syncSub2apiEnabled = computed(() => String(runtimeForm.SYNC_TARGET_SUB2API || '').toLowerCase() === 'true')
-const syncCpaFields = computed(() => syncCpaEnabled.value ? fieldsByKeys(['CPA_URL', 'CPA_KEY']) : [])
 const syncSub2apiConnectionFields = computed(() => syncSub2apiEnabled.value
   ? fieldsByKeys(['SUB2API_URL', 'SUB2API_EMAIL', 'SUB2API_PASSWORD', 'SUB2API_GROUP'])
   : [])
@@ -651,14 +1066,14 @@ const currentRuntimeFields = computed(() => {
   if (selectedRuntimeCategory.value === 'security') {
     return securityFields.value
   }
+  if (selectedRuntimeCategory.value === 'hero_sms') {
+    return heroSmsFields.value
+  }
   return []
 })
 
 const enabledSyncTargetsText = computed(() => {
   const targets = []
-  if (syncCpaEnabled.value) {
-    targets.push('CPA')
-  }
   if (syncSub2apiEnabled.value) {
     targets.push('Sub2API')
   }
@@ -674,17 +1089,16 @@ const currentRuntimeStatus = computed(() => {
   }
 
   if (selectedRuntimeCategory.value === 'sync') {
-    if (!syncCpaEnabled.value && !syncSub2apiEnabled.value) {
+    if (!syncSub2apiEnabled.value) {
       return {
         label: '未启用',
         class: 'border-white/10 bg-white/5 text-slate-400',
       }
     }
 
-    const cpaReady = !syncCpaEnabled.value || syncCpaFields.value.every(field => !isRuntimeRequired(field) || field.configured)
     const sub2apiReady = !syncSub2apiEnabled.value || syncSub2apiConnectionFields.value.every(field => !isRuntimeRequired(field) || field.configured)
 
-    return cpaReady && sub2apiReady
+    return sub2apiReady
       ? {
           label: '已配置',
           class: 'border-emerald-400/20 bg-emerald-500/10 text-emerald-200',
@@ -720,6 +1134,18 @@ const currentRuntimeStatus = computed(() => {
       : {
           label: '未配置',
           class: 'border-red-400/20 bg-red-500/10 text-red-200',
+        }
+  }
+
+  if (selectedRuntimeCategory.value === 'hero_sms') {
+    return heroSmsApiKeyConfigured.value
+      ? {
+          label: '已启用',
+          class: 'border-emerald-400/20 bg-emerald-500/10 text-emerald-200',
+        }
+      : {
+          label: '未启用',
+          class: 'border-white/10 bg-white/5 text-slate-400',
         }
   }
 
@@ -760,14 +1186,28 @@ function setSourceMessage(text, type = 'success') {
 }
 
 function fieldInputType(key) {
-  if (['SUB2API_CONCURRENCY', 'SUB2API_PRIORITY', 'SUB2API_RATE_MULTIPLIER'].includes(key)) {
+  if ([
+    'SUB2API_CONCURRENCY',
+    'SUB2API_PRIORITY',
+    'SUB2API_RATE_MULTIPLIER',
+    'HERO_SMS_MAX_PRICE',
+    'HERO_SMS_HTTP_TIMEOUT',
+    'HERO_SMS_WAIT_SECONDS',
+    'HERO_SMS_PHONE_REUSE_MAX',
+  ].includes(key)) {
     return 'number'
   }
   return key.includes('PASSWORD') || key.includes('KEY') ? 'password' : 'text'
 }
 
+function fieldAutocomplete(key) {
+  // password 字段加 new-password 阻止浏览器把其他网站存的密码自动填充进来,
+  // 否则 v-model 会读到错误的值并被悄悄保存到 .env
+  return fieldInputType(key) === 'password' ? 'new-password' : 'off'
+}
+
 function isToggleField(key) {
-  return key === 'SYNC_TARGET_CPA' || key === 'SYNC_TARGET_SUB2API'
+  return key === 'SYNC_TARGET_SUB2API'
 }
 
 function isBooleanStringField(key) {
@@ -892,6 +1332,18 @@ async function saveSourceConfig() {
 watch(visualCategory, async (next) => {
   if (next === 'source' && !sourceLoaded.value) {
     await loadSourceConfig()
+  }
+  // 切到接码服务且已配置 API Key,自动拉一次国家列表减少手动操作
+  if (next === 'hero_sms' && heroSmsApiKeyConfigured.value && !heroSmsCountries.value.length) {
+    loadHeroSmsCountries()
+  }
+})
+
+// 国家变化时,已加载的服务列表对应的国家就过期了,清空让用户重新拉
+watch(() => runtimeForm.HERO_SMS_COUNTRY, (next, prev) => {
+  if (next !== prev && heroSmsServices.value.length) {
+    heroSmsServices.value = []
+    heroSmsServiceDropdownOpen.value = false
   }
 })
 
