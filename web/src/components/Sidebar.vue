@@ -17,7 +17,7 @@
           <span class="inline-block h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_14px_rgba(52,211,153,0.85)]"></span>
           面板在线
         </div>
-        <p class="mt-1 text-xs leading-5 text-slate-400">统一查看仪表盘、配置、同步、OAuth 和日志。</p>
+        <p class="mt-1 text-xs leading-5 text-slate-400">统一查看仪表盘、配置、同步和日志。</p>
       </div>
     </div>
 

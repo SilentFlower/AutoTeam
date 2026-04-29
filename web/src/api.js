@@ -72,10 +72,35 @@ export const api = {
   getRuntimeConfigSource: () => request('GET', '/config/source'),
   saveRuntimeConfigSource: (payload) => request('PUT', '/config/source', payload),
 
+  getHeroSmsCountries: ({ apiKey = '', baseUrl = '' } = {}) => {
+    const params = new URLSearchParams()
+    if (apiKey) params.set('api_key', apiKey)
+    if (baseUrl) params.set('base_url', baseUrl)
+    const qs = params.toString()
+    return request('GET', `/hero-sms/countries${qs ? `?${qs}` : ''}`)
+  },
+  getHeroSmsServices: ({ apiKey = '', baseUrl = '', country = '', lang = 'cn' } = {}) => {
+    const params = new URLSearchParams()
+    if (apiKey) params.set('api_key', apiKey)
+    if (baseUrl) params.set('base_url', baseUrl)
+    if (country) params.set('country', country)
+    if (lang) params.set('lang', lang)
+    const qs = params.toString()
+    return request('GET', `/hero-sms/services${qs ? `?${qs}` : ''}`)
+  },
+  getHeroSmsAvailability: ({ apiKey = '', baseUrl = '', service = 'dr', limit = 50 } = {}) => {
+    const params = new URLSearchParams()
+    if (apiKey) params.set('api_key', apiKey)
+    if (baseUrl) params.set('base_url', baseUrl)
+    if (service) params.set('service', service)
+    if (limit) params.set('limit', String(limit))
+    const qs = params.toString()
+    return request('GET', `/hero-sms/availability${qs ? `?${qs}` : ''}`)
+  },
+
   getStatus: () => request('GET', '/status'),
   getAdminStatus: () => request('GET', '/admin/status'),
   getMainCodexStatus: () => request('GET', '/main-codex/status'),
-  getManualAccountStatus: () => request('GET', '/manual-account/status'),
   getAccounts: () => request('GET', '/accounts'),
   getActiveAccounts: () => request('GET', '/accounts/active'),
   getStandbyAccounts: () => request('GET', '/accounts/standby'),
@@ -83,7 +108,6 @@ export const api = {
   loginAccount: (email) => request('POST', '/accounts/login', { email }),
   getCodexAuth: (email) => request('GET', `/accounts/${encodeURIComponent(email)}/codex-auth`),
   kickAccount: (email) => request('POST', `/accounts/${encodeURIComponent(email)}/kick`),
-  getCpaFiles: () => request('GET', '/cpa/files'),
 
   startAdminLogin: (email) => request('POST', '/admin/login/start', { email }),
   submitAdminSession: (email, sessionToken) => request('POST', '/admin/login/session', { email, session_token: sessionToken }),
@@ -116,13 +140,8 @@ export const api = {
   submitMainCodexPassword: (password) => request('POST', '/main-codex/password', { password }),
   submitMainCodexCode: (code) => request('POST', '/main-codex/code', { code }),
   cancelMainCodexSync: () => request('POST', '/main-codex/cancel'),
-  deleteMainCodexFromCpa: () => request('POST', '/main-codex/delete-cpa'),
-  startManualAccount: () => request('POST', '/manual-account/start'),
-  submitManualAccountCallback: (redirectUrl) => request('POST', '/manual-account/callback', { redirect_url: redirectUrl }),
-  cancelManualAccount: () => request('POST', '/manual-account/cancel'),
 
   postSync: () => request('POST', '/sync'),
-  postSyncFromCpa: () => request('POST', '/sync/from-cpa'),
   postSyncAccounts: () => request('POST', '/sync/accounts'),
   postSyncMainCodex: () => request('POST', '/sync/main-codex'),
 
@@ -130,8 +149,6 @@ export const api = {
   startCheck: () => request('POST', '/tasks/check'),
   startAdd: () => request('POST', '/tasks/add'),
   // 邀请加号：通过母号发邀请 + 自动登录 + Codex OAuth 入池（后台执行）。
-  // 后端路由是否存在视部署版本而定（见 PR4 / 别人未提交工作树），404 时
-  // InviteFlowModal 会原样展示错误。
   startAddViaInvite: () => request('POST', '/tasks/add-via-invite'),
   startFill: (target = 5) => request('POST', '/tasks/fill', { target }),
   startCleanup: (maxSeats = null) => request('POST', '/tasks/cleanup', { max_seats: maxSeats }),

@@ -5,15 +5,24 @@
       {{ adminHint }}
     </div>
     <div class="flex flex-wrap gap-3">
-      <button v-for="action in visibleActions" :key="action.key"
-        @click="execute(action)"
-        :disabled="isDisabled(action)"
-        class="px-4 py-2 rounded-lg text-sm font-medium transition border"
-        :class="isDisabled(action)
-          ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
-          : `${action.style} hover:opacity-80`">
-        {{ action.label }}
-      </button>
+      <!-- 每个按钮包一层 group,用于 hover 时浮出 tooltip(仅 action.tooltip 存在时渲染) -->
+      <div v-for="action in visibleActions" :key="action.key" class="relative group">
+        <button
+          @click="execute(action)"
+          :disabled="isDisabled(action)"
+          class="px-4 py-2 rounded-lg text-sm font-medium transition border"
+          :class="isDisabled(action)
+            ? 'bg-gray-800 text-gray-500 border-gray-700 cursor-not-allowed'
+            : `${action.style} hover:opacity-80`">
+          {{ action.label }}
+        </button>
+        <div v-if="action.tooltip"
+          class="invisible opacity-0 group-hover:visible group-hover:opacity-100 transition-opacity absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 bg-gray-950 border border-gray-700 rounded-lg text-xs leading-relaxed text-gray-200 w-72 z-20 pointer-events-none shadow-lg">
+          {{ action.tooltip }}
+          <!-- 三角箭头,贴在浮层底部指向按钮 -->
+          <div class="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-gray-700"></div>
+        </div>
+      </div>
     </div>
 
     <!-- 参数输入 -->
@@ -60,10 +69,12 @@ const actions = [
   { key: 'check', group: 'pool', label: '检查额度', method: 'startCheck', needParam: false, style: 'bg-emerald-600 text-white border-emerald-500' },
   { key: 'fill', group: 'pool', label: '补满成员', method: 'startFill', needParam: true, paramName: 'target', style: 'bg-violet-600 text-white border-violet-500' },
   { key: 'add', group: 'pool', label: '添加账号', method: 'startAdd', needParam: false, style: 'bg-amber-600 text-white border-amber-500' },
+  { key: 'add-via-invite', group: 'pool', label: '邀请加号', method: 'startAddViaInvite', needParam: false, style: 'bg-orange-600 text-white border-orange-500' },
   { key: 'cleanup', group: 'pool', label: '清理成员', method: 'startCleanup', needParam: false, style: 'bg-rose-600 text-white border-rose-500' },
-  { key: 'sync', group: 'sync', label: '同步远端', method: 'postSync', needParam: false, sync: true, allowWithoutAdmin: true, style: 'bg-cyan-600 text-white border-cyan-500' },
-  { key: 'pull-cpa', group: 'sync', label: '拉取 CPA', method: 'postSyncFromCpa', needParam: false, sync: true, allowWithoutAdmin: true, style: 'bg-emerald-600 text-white border-emerald-500' },
-  { key: 'sync-accounts', group: 'sync', label: '同步账号', method: 'postSyncAccounts', needParam: false, sync: true, allowWithoutAdmin: true, style: 'bg-sky-600 text-white border-sky-500' },
+  { key: 'sync', group: 'sync', label: '同步远端', method: 'postSync', needParam: false, sync: true, allowWithoutAdmin: true, style: 'bg-cyan-600 text-white border-cyan-500',
+    tooltip: '把本地 active 账号推送到 Sub2API：远端已存在则更新，不存在则创建，本地非 active 的反向删除。不写本地。' },
+  { key: 'sync-accounts', group: 'sync', label: '同步账号', method: 'postSyncAccounts', needParam: false, sync: true, allowWithoutAdmin: true, style: 'bg-sky-600 text-white border-sky-500',
+    tooltip: '用 Team 实际成员名单 + auths 目录回灌本地 accounts.json：对账状态、自动补建丢失的本地记录。不动远端。' },
 ]
 
 const showParams = ref(false)
@@ -84,7 +95,7 @@ const panelTitle = computed(() => {
 })
 const adminHint = computed(() => {
   if (props.mode === 'sync') {
-    return '同步类操作可独立使用：同步账号、同步已启用远端、拉取 CPA。'
+    return '同步类操作可独立使用：同步账号、同步已启用远端。'
   }
   return '请先在「配置面板」页完成管理员登录后，轮转/补满/清理等账号池操作才会开放。'
 })

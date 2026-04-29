@@ -80,7 +80,7 @@
           </div>
 
           <div class="mt-5 rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-xs leading-6 text-slate-400">
-            如果你是首次部署，启动后只需要先配置 API Key。CloudMail、CPA / Sub2API、代理等运行项可以在登录后进入配置面板继续设置。
+            如果你是首次部署，启动后只需要先配置 API Key。CloudMail、Sub2API、代理等运行项可以在登录后进入配置面板继续设置。
           </div>
         </div>
       </div>
@@ -168,7 +168,6 @@ const currentPage = ref('workbench')
 const status = ref(null)
 const adminStatus = ref(null)
 const codexStatus = ref(null)
-const manualAccountStatus = ref(null)
 const tasks = ref([])
 const loading = ref(false)
 const runningTask = ref(null)
@@ -233,18 +232,16 @@ function doLogout() {
 async function refresh() {
   loading.value = true
   try {
-    const [s, t, admin, codex, manualAccount] = await Promise.all([
+    const [s, t, admin, codex] = await Promise.all([
       api.getStatus(),
       api.getTasks(),
       api.getAdminStatus(),
       api.getMainCodexStatus(),
-      api.getManualAccountStatus(),
     ])
     status.value = s
     tasks.value = t
     adminStatus.value = admin
     codexStatus.value = codex
-    manualAccountStatus.value = manualAccount
     runningTask.value = t.find(t => t.status === 'running' || t.status === 'pending') || null
   } catch (e) {
     if (e.status === 401) {

@@ -160,28 +160,21 @@
         <div v-else-if="!codexBusy" class="flex flex-wrap gap-3">
           <button
             @click="loginMainCodex"
-            :disabled="submitting || syncingMain || deletingMainCpa"
+            :disabled="submitting || syncingMain"
             class="px-4 py-2 bg-blue-700 hover:bg-blue-600 text-white text-sm rounded-lg transition disabled:opacity-50"
           >
             {{ syncingMain && mainCodexSubmittingAction === 'login' ? '登录中...' : '登录主号 Codex' }}
           </button>
           <button
             @click="syncMainCodex"
-            :disabled="submitting || syncingMain || deletingMainCpa"
+            :disabled="submitting || syncingMain"
             class="px-4 py-2 bg-cyan-700 hover:bg-cyan-600 text-white text-sm rounded-lg transition disabled:opacity-50"
           >
             {{ syncingMain && mainCodexSubmittingAction === 'sync' ? '同步中...' : '同步主号 Codex 到已启用远端' }}
           </button>
           <button
-            @click="deleteMainCodexFromCpa"
-            :disabled="submitting || syncingMain || deletingMainCpa"
-            class="px-4 py-2 bg-amber-700 hover:bg-amber-600 text-white text-sm rounded-lg transition disabled:opacity-50"
-          >
-            {{ deletingMainCpa ? '删除中...' : '从 CPA 删除主号文件' }}
-          </button>
-          <button
             @click="logoutAdmin"
-            :disabled="submitting || syncingMain || deletingMainCpa"
+            :disabled="submitting || syncingMain"
             class="px-4 py-2 bg-rose-700/80 hover:bg-rose-700 text-white text-sm rounded-lg transition disabled:opacity-50"
           >
             {{ submitting ? '处理中...' : '清除登录态' }}
@@ -414,7 +407,6 @@ const codexCode = ref('')
 const submitting = ref(false)
 const syncingMain = ref(false)
 const mainCodexSubmittingAction = ref('')
-const deletingMainCpa = ref(false)
 const message = ref('')
 const messageClass = ref('')
 const adminSubmittingHint = ref('')
@@ -677,19 +669,6 @@ async function cancelMainCodexSync() {
     setMessage(e.message, 'error')
   } finally {
     syncingMain.value = false
-  }
-}
-
-async function deleteMainCodexFromCpa() {
-  deletingMainCpa.value = true
-  try {
-    const result = await api.deleteMainCodexFromCpa()
-    setMessage(result.message || '已从 CPA 删除主号文件')
-    emit('refresh')
-  } catch (e) {
-    setMessage(e.message, 'error')
-  } finally {
-    deletingMainCpa.value = false
   }
 }
 

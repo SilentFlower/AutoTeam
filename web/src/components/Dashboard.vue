@@ -118,7 +118,7 @@
                 <li>将下方内容保存到 <code class="bg-gray-800 px-1 rounded">~/.codex/auth.json</code>（Windows: <code class="bg-gray-800 px-1 rounded">%APPDATA%\codex\auth.json</code>）</li>
                 <li>重新启动 Codex CLI</li>
               </ol>
-              <div class="text-xs text-amber-400/60">导出后 Codex CLI 直连 OpenAI，不走 CPA 代理，响应更快。</div>
+              <div class="text-xs text-amber-400/60">导出后 Codex CLI 直连 OpenAI，响应更快。</div>
             </div>
             <div class="relative">
               <pre class="bg-gray-950 border border-gray-800 rounded-lg p-4 text-xs font-mono text-gray-300 overflow-x-auto whitespace-pre">{{ exportJson }}</pre>
