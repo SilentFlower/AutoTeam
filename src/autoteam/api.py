@@ -1,5 +1,6 @@
 """AutoTeam HTTP API - 将 CLI 功能暴露为 HTTP 接口"""
 
+import inspect
 import json
 import logging
 import os
@@ -1180,19 +1181,45 @@ def _is_main_account_email(email: str | None, admin_id: str | None = None) -> bo
     return normalized == _normalized_email(admin_email)
 
 
+def _func_accepts_admin_id(func) -> bool:
+    """检测 ``func`` 的签名中是否声明了 ``admin_id`` 关键字参数。
+
+    用于替代以前"try/except TypeError"的兜底兼容写法——后者会把生产代码
+    内部抛出的真实 TypeError 静默吞掉，导致悄悄退化成不带 admin_id 调用，
+    可能写错 admin 目录。
+
+    :param func: 待检测的 callable。
+    :return: ``True`` 表示签名里能接受 ``admin_id``（直接 kwarg 或经 ``**kwargs``
+        透传）；``False`` 表示不接受（多半是旧测试 monkeypatch 出的 1-arg
+        lambda）。无法 introspect（如 C 实现的内置函数）时保守返回 ``False``。
+    """
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        # 内置或 C 函数等无法 introspect：按"不接受"处理，等价旧逻辑里 fallback 的分支。
+        return False
+    params = sig.parameters
+    if "admin_id" in params:
+        return True
+    # 接受 **kwargs 的也认为能透传 admin_id。
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def _email_is_main(email: str | None, admin_id: str | None = None) -> bool:
     """``_is_main_account_email`` 的间接调用，兼容把后者 monkeypatch 成 1-arg lambda 的旧测试。
 
     路由层统一通过本函数调用，避免直接以 ``(email, admin_id)`` 签名调用 monkeypatch
     替换出的 1 参 lambda 引发 TypeError。
 
+    用 ``inspect.signature`` 探测 ``_is_main_account_email`` 是否接受 ``admin_id``，
+    避免 try/except 吞掉生产代码内部 TypeError。
+
     :param email: 待判断邮箱。
     :param admin_id: 目标 admin_id；可为 ``None``。
     """
-    try:
+    if _func_accepts_admin_id(_is_main_account_email):
         return _is_main_account_email(email, admin_id)
-    except TypeError:
-        return _is_main_account_email(email)
+    return _is_main_account_email(email)
 
 
 def _admin_state_call(func, admin_id: str | None, *args, **kwargs):
@@ -1202,21 +1229,20 @@ def _admin_state_call(func, admin_id: str | None, *args, **kwargs):
     已为它们补了 ``admin_id`` 参数），优先按新签名调用；如果调用方已经被
     monkeypatch 替换为旧签名（无 admin_id），自动 fallback。
 
+    采用 ``inspect.signature`` 检测目标函数是否接受 ``admin_id`` 关键字参数，
+    避免旧实现"try/except TypeError 围绕 func 调用"造成的副作用——后者会把
+    生产代码内部抛的真实 TypeError 也吞掉，悄悄退化成不带 admin_id 调用，
+    可能写错 admin 目录。
+
     :param func: 目标函数。
     :param admin_id: 目标 admin_id；可为 ``None``。
     :param args: 透传给 ``func`` 的位置参数（admin_id 之外）。
     :param kwargs: 透传给 ``func`` 的关键字参数（admin_id 之外）。
     :return: ``func`` 返回值。
     """
-    try:
+    if _func_accepts_admin_id(func):
         return func(*args, admin_id=admin_id, **kwargs)
-    except TypeError:
-        # admin_id 不是接受的关键字参数；可能是 monkeypatch 的旧签名 lambda。
-        try:
-            return func(*args, **kwargs)
-        except TypeError:
-            # 旧测试有时 patch 成不接收任何参数；最后兜底再试一次零参形态。
-            return func()
+    return func(*args, **kwargs)
 
 
 def _quota_snapshot_status(quota_info: dict | None) -> str:
