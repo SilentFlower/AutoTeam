@@ -223,6 +223,103 @@ for attempt in range(max_attempts):
 | 在异常 message 里塞完整 HTML 响应 | traceback 会污染日志。请用 `_response_excerpt(body)` 截断（参考 `account_ops.py`）。 |
 | 在 API 端点函数里直接写业务异常处理 | 业务异常在业务模块抛，端点函数只做 `try/except → HTTPException` 翻译。 |
 | 自定义异常但未提供结构化字段 | 自定义类只在调用方需要按字段分支时才有意义（如 `HeroSmsError.code`）。 |
+| `try/except TypeError` 围绕 `func(...)` 调用做参数兼容 | catch 范围会**吞掉 func 内部抛的真实 TypeError**(比如某字段类型错),静默退化成不带新参的调用,潜在地写错路径或丢数据。改用 `inspect.signature(func).parameters` 显式探测是否接受新参,详见下方 "动态参数适配" 章节。 |
+
+## 动态参数适配:用 inspect 而非 try/except
+
+当数据层函数从 `func(*args)` 升级为 `func(*args, new_param=None)` 后,代码或测试可能仍持有旧版本签名(典型场景:旧测试 `monkeypatch.setattr(mod, "func", lambda x: ...)` 用 1-arg lambda 替换)。两种适配方式的对比:
+
+```python
+# ❌ 反模式:catch 整个 func 调用的 TypeError
+def call(func, x, *, new_param=None):
+    try:
+        return func(x, new_param=new_param)
+    except TypeError:
+        # 期望兼容不接受 new_param 的旧签名,但实际会同时吞掉 func 内部
+        # 抛的真实 TypeError(参数类型错、属性不存在等),让 bug 静默
+        return func(x)
+```
+
+```python
+# ✅ 正确做法:基于签名探测
+import inspect
+
+def call(func, x, *, new_param=None):
+    try:
+        sig = inspect.signature(func)
+    except (TypeError, ValueError):
+        sig = None  # 内置/C 扩展函数可能取不到签名
+    if sig is not None and "new_param" in sig.parameters:
+        return func(x, new_param=new_param)
+    return func(x)
+```
+
+**适用场景**:支持渐进式重构(老调用方/老测试零改动迁移到新签名),但又不想为兼容写危险的 `try/except` 包装。真实例:`src/autoteam/api.py` 的 `_admin_state_call` / `_email_is_main`(`feat/multi-admin` 分支)。
+
+**注意**:inspect 探测有可忽略的开销,不要放进高频热路径;如果适配只是为了兼容测试,长期目标是修测试而非保留 wrapper。
+
+---
+
+## 资源创建与回滚一致性
+
+**原则**:在持久化新资源(写 JSON 索引、创建目录树)**之前**,先确认能完成创建流程;否则在异常路径里主动 rollback 残留物,不要留"空壳"。
+
+### 反例:空壳锁死
+
+PR2 `_prepare_admin_login_target` 一开始的实现是先 `add_admin` 写入 `admins.json`、再 `begin_admin_login` 走 Playwright:
+
+```python
+# ❌ 反模式
+def begin_admin_login_for_new(email):
+    admin = Admin(admin_id=uuid.uuid4().hex[:8], email=email, ...)
+    admin_registry.add_admin(admin)            # 立即持久化
+    admin_registry.set_active_admin(admin.admin_id)
+    return _begin_admin_login_playwright(...)  # 任何异常都会留下空壳
+```
+
+中途任何步骤(密码错、邮箱验证码错、Playwright 启动失败、用户取消)都会留下一条没有 `workspace_name` / `account_id` 的空壳 admin。叠加 DELETE 路由的"禁止删除唯一 admin"防护,**用户首次唯一一次创建失败 → 系统中只剩这一条空壳 → 删不掉 → 锁死**。
+
+### 修复策略
+
+任选其一:
+
+```python
+# ✅ 策略 A:推迟持久化到流程完成后
+def begin_admin_login_for_new(email):
+    pending_admin_id = uuid.uuid4().hex[:8]    # 仅内存中
+    _admin_login_target = pending_admin_id
+    result = _begin_admin_login_playwright(...)
+    if result.completed:
+        admin = Admin(admin_id=pending_admin_id, email=email,
+                      workspace_name=result.workspace, ...)
+        admin_registry.add_admin(admin)        # 完成后才写 admins.json
+    return result
+```
+
+```python
+# ✅ 策略 B:写入即持久化但异常路径主动回滚
+def begin_admin_login_for_new(email):
+    admin = Admin(admin_id=uuid.uuid4().hex[:8], email=email, ...)
+    admin_registry.add_admin(admin)
+    try:
+        return _begin_admin_login_playwright(...)
+    except Exception:
+        # 仅当 admin 还是空壳(没走完流程)时才回滚
+        if admin_registry.get_admin(admin.admin_id).workspace_name is None:
+            admin_registry.remove_admin(admin.admin_id)
+        raise
+```
+
+**怎么选**:策略 A 更干净(数据库无中间态),但需要重写流程让中间状态全在内存;策略 B 改动小,适合既有写入路径已深度耦合的情况(本项目 PR2 选了策略 B)。
+
+### 检查清单
+
+引入新的"创建-验证-激活"多步流程时,审视:
+
+- [ ] 流程中途异常时,持久化层(JSON / DB)是否会留下半成品?
+- [ ] 半成品是否会跟"删除唯一资源"等业务约束冲突,导致用户无法清理?
+- [ ] 单元测试是否覆盖了"start → 中间步失败 → 清理"完整路径?
+- [ ] error path 是否区分了"业务失败需保留状态供重试"和"系统失败需主动回滚"?
 
 ---
 
@@ -233,3 +330,5 @@ for attempt in range(max_attempts):
 3. **重试循环忘了 `logger.warning`**——出问题时看不到中间过程。
 4. **`from exc` 漏掉**——异常链断了，看不到根因。
 5. **业务模块 catch 后既不重抛也不记日志**——典型的"静默失败"，最难排查。
+6. **资源创建过早写持久化、异常路径不回滚**——会留空壳与业务约束(如"禁止删除唯一资源")冲突,见上方"资源创建与回滚一致性"章节。
+7. **用 `try/except TypeError` 适配函数签名变化**——会吞掉 func 内部真实 TypeError,改用 `inspect.signature` 探测,见"动态参数适配"章节。

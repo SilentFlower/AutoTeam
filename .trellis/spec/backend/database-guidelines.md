@@ -224,6 +224,117 @@ auth_retry_count = a.get("auth_retry_count", 0)
 
 ---
 
+## 多租户/多账号:目录树拆分而非文件内 owner_id 字段
+
+当一份 JSON(如 `accounts.json`、`state.json`)从"全局唯一"演进为"按 owner_id 多份"时,**首选按目录树拆分**而不是给每条记录加 `owner_id` 字段共用单文件。
+
+### 真例:多管理员主号(`feat/multi-admin` 分支)
+
+```
+data/
+├── admins.json                       # 索引(admins[] + active_owner_id)
+├── admins/
+│   ├── <owner_id_a>/                 # 每个 owner 一个工作区目录
+│   │   ├── state.json                # 凭据/email/workspace 信息
+│   │   ├── accounts.json             # 该 owner 的子账号池
+│   │   └── auths/codex-main-*.json   # 凭据文件
+│   └── <owner_id_b>/...
+└── legacy-backup/<timestamp>/        # 旧单 owner → 多 owner 的自动迁移备份
+```
+
+### 选目录树而非单文件加字段的原因
+
+| 方面 | 单文件加 `owner_id` 字段 | 目录树按 owner 拆分 |
+|------|--------------------------|--------------------|
+| 读写性能 | 每次操作都要全表过滤 | 按 owner_id 直接定位文件 |
+| 删除 owner | 需要全表 filter 出该 owner 的记录再批量删除 | `shutil.rmtree(owner_dir)` 一步 |
+| 备份/迁移 | 整个文件作为一个原子单位 | 单个 owner 可独立备份/迁移 |
+| 测试隔离 | monkeypatch 全局文件路径影响所有 owner | 各 owner 目录天然隔离 |
+| 与既有数据层兼容 | 所有 `load_xxx()` / `save_xxx()` 都要加 `owner_id` 过滤参数 | 仅在路径函数加 `owner_id` 入参,业务逻辑无感 |
+| Docker 卷挂载 | 单文件挂载,改字段不动挂载 | 必须挂目录,文档需更新 |
+
+### 实施模板
+
+```python
+# data 层路径常量改为函数,接受 owner_id 入参
+def _accounts_file(owner_id: str) -> Path:
+    return PROJECT_ROOT / "data" / "owners" / owner_id / "accounts.json"
+
+# 各 CRUD 函数接收可选 owner_id,缺省 fallback 到当前激活 owner(向后兼容)
+def load_accounts(owner_id: str | None = None):
+    if owner_id is None:
+        owner_id = owner_registry.get_active_owner_id()
+    if owner_id is None:
+        return []  # 全新部署/未迁移
+    path = _accounts_file(owner_id)
+    if path.exists():
+        text = read_text(path).strip()
+        if text:
+            return json.loads(text)
+    return []
+```
+
+### 自动迁移检查清单(首次启动)
+
+```python
+def bootstrap_owner_registry():
+    new_index = PROJECT_ROOT / "data" / "owners.json"
+    if new_index.exists():
+        return  # 已迁移,零代价跳过
+
+    # 检测旧文件(全局单文件结构)
+    legacy_files = [PROJECT_ROOT / "state.json", PROJECT_ROOT / "accounts.json"]
+    if not any(f.exists() for f in legacy_files):
+        # 全新部署,写空索引
+        write_text(new_index, json.dumps({"owners": [], "active_owner_id": None}, ...))
+        return
+
+    # 1. 备份(用 shutil.copy2 不是 move,失败回退要保留原文件)
+    backup_dir = PROJECT_ROOT / "data" / "legacy-backup" / datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for f in legacy_files:
+        if f.exists():
+            shutil.copy2(f, backup_dir / f.name)
+
+    # 2. 生成 owner_id 与目录
+    new_owner_id = uuid.uuid4().hex[:8]
+    new_dir = PROJECT_ROOT / "data" / "owners" / new_owner_id
+    new_dir.mkdir(parents=True, exist_ok=True)
+
+    # 3. 移动旧文件(到这里才 move,因为前面已备份过)
+    for f in legacy_files:
+        if f.exists():
+            shutil.move(str(f), str(new_dir / f.name))
+
+    # 4. 最后写 owners.json,失败时不留半成品
+    write_text(new_index, json.dumps({
+        "owners": [{"owner_id": new_owner_id, ...}],
+        "active_owner_id": new_owner_id,
+    }, indent=2, ensure_ascii=False))
+```
+
+**关键约束**:
+
+- **先 copy 备份再 move 原文件**——失败时原文件还在,可重试
+- **最后才写新索引**——半成品索引会让下次启动以为"已迁移"导致再也不进迁移分支
+- **`shutil.copy2` 而非 `copy`**——保留 mtime/权限,Docker 卷下避免权限问题
+- **任何异常都不删原文件**——`legacy-backup/` 永远是兜底退路
+
+### 反模式(单文件加字段)
+
+```python
+# ❌ 不推荐:在 accounts.json 里给每条记录加 owner_admin_id 字段
+[
+  {"email": "a@x.com", "owner_admin_id": "abc12345", ...},
+  {"email": "b@y.com", "owner_admin_id": "abc12345", ...},
+  {"email": "c@z.com", "owner_admin_id": "def67890", ...},  # 不同 owner 的账号混在同一文件
+]
+```
+
+问题:删除 owner 要扫全表;`monkeypatch` 测试时所有 owner 共享同一份 mock 数据;Docker 卷不变但语义上单文件被多 owner 共享,排查脏数据时谁是谁的难分清。
+
+---
+
 ## 常见错误
 
 1. **直接读 `accounts.json`** 不走 `load_accounts()`——会绕过 BOM 容错和空文件兜底。
@@ -231,3 +342,5 @@ auth_retry_count = a.get("auth_retry_count", 0)
 3. **存 `datetime.now()` 字符串到 JSON**——要么是 `time.time()` 浮点，要么不存。
 4. **改 `STATUS_*` 常量值**（如 `"active"` → `"ACTIVE"`）——历史 JSON 里全是旧值，会瞬间让所有账号"消失"。
 5. **新建第二份 JSON 文件**（如 `quota.json`）——能合进 `accounts.json` 的字段就合，别拆。
+6. **多租户/多账号场景给单文件加 `owner_id` 字段而不拆目录**——见上方"多租户/多账号"章节。
+7. **自动迁移先 move 后备份**——失败时原文件已丢,无法重试;正确顺序是先 copy 备份、最后才 move + 写新索引。
