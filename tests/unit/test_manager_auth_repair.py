@@ -19,6 +19,8 @@ def test_record_auth_repair_failure_pauses_on_add_phone(monkeypatch):
     )
     monkeypatch.setattr(manager, "update_account", lambda email, **kwargs: updates.append((email, kwargs)))
     monkeypatch.setattr(manager.time, "time", lambda: 1_700_000_000)
+    # 锁定 HeroSMS 未配置,验证 add_phone 仍然走 hard-fail 分支
+    monkeypatch.setattr("autoteam.hero_sms.is_hero_sms_configured", lambda: False)
 
     state = manager._record_auth_repair_failure("user@example.com", "add_phone", "需要手机号验证")
 
@@ -37,6 +39,26 @@ def test_record_auth_repair_failure_pauses_on_add_phone(monkeypatch):
             },
         )
     ]
+
+
+def test_record_auth_repair_failure_retries_add_phone_when_hero_sms_configured(monkeypatch):
+    """配置 HeroSMS 后 add_phone 应降级为可重试,而不是直接暂停账号。"""
+    updates = []
+    monkeypatch.setattr(
+        manager,
+        "load_accounts",
+        lambda: [{"email": "user@example.com", "auth_retry_count": 0}],
+    )
+    monkeypatch.setattr(manager, "update_account", lambda email, **kwargs: updates.append((email, kwargs)))
+    monkeypatch.setattr(manager.time, "time", lambda: 1_700_000_000)
+    monkeypatch.setattr(manager, "_auth_repair_retry_delays", lambda: (600, 1200, 1800))
+    monkeypatch.setattr("autoteam.hero_sms.is_hero_sms_configured", lambda: True)
+
+    state = manager._record_auth_repair_failure("user@example.com", "add_phone", "需要手机号验证")
+
+    assert state["auth_retry_paused"] is False
+    assert state["auth_retry_after"] == 1_700_000_600
+    assert state["auth_retry_count"] == 1
 
 
 def test_record_auth_repair_failure_uses_auto_check_interval_backoff(monkeypatch):
@@ -116,6 +138,8 @@ def test_login_codex_with_result_stops_immediately_on_hard_failure(monkeypatch):
         }
 
     monkeypatch.setattr(manager, "login_codex_via_browser", fake_login)
+    # HeroSMS 关闭时 add_phone 是硬失败,不应继续重试
+    monkeypatch.setattr("autoteam.hero_sms.is_hero_sms_configured", lambda: False)
 
     result = manager._login_codex_with_result("user@example.com", "", max_attempts=3)
 
@@ -123,6 +147,39 @@ def test_login_codex_with_result_stops_immediately_on_hard_failure(monkeypatch):
     assert result["ok"] is False
     assert result["error_type"] == "add_phone"
     assert result["attempts"] == 1
+
+
+def test_login_codex_with_result_retries_add_phone_when_hero_sms_configured(monkeypatch):
+    """HeroSMS 启用后 add_phone 应进入本轮重试,而不是立即终止。"""
+    attempts = {"count": 0}
+
+    def fake_login(email, password, mail_client=None, return_result=False):
+        assert return_result is True
+        attempts["count"] += 1
+        if attempts["count"] < 2:
+            return {
+                "ok": False,
+                "bundle": None,
+                "error_type": "add_phone",
+                "error_detail": "需要手机号验证",
+                "retryable": True,
+            }
+        return {
+            "ok": True,
+            "bundle": {"email": email, "plan_type": "team"},
+            "error_type": None,
+            "error_detail": None,
+            "retryable": False,
+        }
+
+    monkeypatch.setattr(manager, "login_codex_via_browser", fake_login)
+    monkeypatch.setattr("autoteam.hero_sms.is_hero_sms_configured", lambda: True)
+
+    result = manager._login_codex_with_result("user@example.com", "", max_attempts=3)
+
+    assert attempts["count"] == 2
+    assert result["ok"] is True
+    assert result["attempts"] == 2
 
 
 def test_login_codex_with_result_rejects_non_team_bundle(monkeypatch):

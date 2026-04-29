@@ -33,9 +33,6 @@ REQUIRED_CONFIGS = [
     ("CF_TEMP_EMAIL_BASE_URL", "Cloudflare Temp Email 地址", "", True),
     ("CF_TEMP_EMAIL_ADMIN_PASSWORD", "Cloudflare Temp Email 管理密码", "", True),
     ("CF_TEMP_EMAIL_DOMAIN", "Cloudflare Temp Email 邮箱域名（如 example.com）", "", True),
-    ("SYNC_TARGET_CPA", "启用 CPA 同步（true/false）", "", True),
-    ("CPA_URL", "CPA (CLIProxyAPI) 地址", "http://127.0.0.1:8317", True),
-    ("CPA_KEY", "CPA 管理密钥", "", True),
     ("SYNC_TARGET_SUB2API", "启用 Sub2API 同步（true/false）", "", True),
     ("SUB2API_URL", "Sub2API 地址", "", True),
     ("SUB2API_EMAIL", "Sub2API 管理员邮箱", "", True),
@@ -52,6 +49,16 @@ REQUIRED_CONFIGS = [
     ("SUB2API_OVERWRITE_ACCOUNT_SETTINGS", "Sub2API 同步时覆盖账号默认设置（true/false）", "false", True),
     ("PLAYWRIGHT_PROXY_URL", "Playwright 浏览器代理 URL（可选，如 socks5://host:port）", "", True),
     ("PLAYWRIGHT_PROXY_BYPASS", "Playwright 代理绕过列表（可选，如 localhost,127.0.0.1）", "", True),
+    ("HERO_SMS_BASE_URL", "HeroSMS API 入口（默认 https://hero-sms.com/stubs/handler_api.php）", "https://hero-sms.com/stubs/handler_api.php", True),
+    ("HERO_SMS_API_KEY", "HeroSMS API Key（留空则关闭自动接码）", "", True),
+    ("HERO_SMS_SERVICE", "HeroSMS 服务代码（OpenAI 在 hero-sms 上的代码是 dr，兼容站点请自行查询）", "dr", True),
+    ("HERO_SMS_COUNTRY", "HeroSMS 国家 ID（hero-sms 自家编号，187=USA、0=Russia、3=China）", "187", True),
+    ("HERO_SMS_OPERATOR", "HeroSMS 指定运营商（可选，逗号分隔）", "", True),
+    ("HERO_SMS_MAX_PRICE", "HeroSMS 最大可接受单价（0 表示不限）", "0", True),
+    ("HERO_SMS_HTTP_TIMEOUT", "HeroSMS HTTP 超时秒数", "30", True),
+    ("HERO_SMS_WAIT_SECONDS", "HeroSMS 等待 SMS code 的最长秒数", "180", True),
+    ("HERO_SMS_PHONE_REUSE_MAX", "号码复用上限（一个号码最多成功验证多少次后停止复用，0=不限）", "3", True),
+    ("HERO_SMS_FORCE_NEW_PHONE", "强制每次申请新号（true/false，关掉号码复用）", "false", True),
     ("API_KEY", "API 鉴权密钥（回车自动生成）", "", False),
 ]
 
@@ -275,45 +282,6 @@ def _verify_mail_provider(provider: str | None = None):
     if resolved == MAIL_PROVIDER_CLOUDFLARE_TEMP_EMAIL:
         return _verify_cloudflare_temp_email()
     return _verify_cloudmail()
-
-
-def _verify_cpa():
-    """验证 CPA 配置是否正确：获取认证文件列表"""
-    cpa_url = os.environ.get("CPA_URL", "")
-    cpa_key = os.environ.get("CPA_KEY", "")
-
-    if not cpa_url or not cpa_key:
-        return True  # 没配就跳过
-
-    logger.info("[验证] CPA 配置...")
-
-    try:
-        import requests
-
-        resp = requests.get(
-            f"{cpa_url}/v0/management/auth-files",
-            headers={"Authorization": f"Bearer {cpa_key}"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            count = len(data.get("files", []))
-            logger.info("[验证] CPA 连接成功（当前 %d 个认证文件）", count)
-            return True
-        if resp.status_code == 401:
-            logger.error("[验证] CPA 连接失败: 密钥无效 (401)")
-            logger.error("[验证] 请检查 CPA_KEY 是否正确")
-            return False
-        logger.error("[验证] CPA 连接失败: HTTP %d", resp.status_code)
-        logger.error("[验证] 请检查 CPA_URL 是否正确")
-        return False
-    except requests.exceptions.ConnectionError:
-        logger.error("[验证] CPA 连接失败: 无法连接到 %s", cpa_url)
-        logger.error("[验证] 请检查 CPA_URL 是否正确，CPA 服务是否已启动")
-        return False
-    except Exception as e:
-        logger.error("[验证] CPA 连接失败: %s", e)
-        return False
 
 
 def _verify_sub2api():

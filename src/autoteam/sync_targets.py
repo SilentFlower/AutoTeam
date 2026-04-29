@@ -1,21 +1,18 @@
-"""统一远端同步目标分发：CPA / Sub2API。"""
+"""统一远端同步目标分发：仅 Sub2API。"""
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Mapping
 
 from autoteam.textio import parse_env_value
 
-SYNC_TARGET_CPA = "cpa"
+logger = logging.getLogger(__name__)
+
 SYNC_TARGET_SUB2API = "sub2api"
 
 _SYNC_TARGET_META = {
-    SYNC_TARGET_CPA: {
-        "label": "CPA",
-        "toggle_key": "SYNC_TARGET_CPA",
-        "config_keys": ("CPA_URL", "CPA_KEY"),
-    },
     SYNC_TARGET_SUB2API: {
         "label": "Sub2API",
         "toggle_key": "SYNC_TARGET_SUB2API",
@@ -112,13 +109,9 @@ def get_missing_target_configs(
 
 
 def sync_to_configured_targets():
+    """把账号池同步到所有已启用的远端目标。"""
     results = {}
     enabled_targets = get_enabled_sync_targets()
-
-    if SYNC_TARGET_CPA in enabled_targets:
-        from autoteam.cpa_sync import sync_to_cpa
-
-        results[SYNC_TARGET_CPA] = sync_to_cpa()
 
     if SYNC_TARGET_SUB2API in enabled_targets:
         from autoteam.sub2api_sync import sync_to_sub2api
@@ -129,13 +122,9 @@ def sync_to_configured_targets():
 
 
 def sync_main_codex_to_configured_targets(filepath: str):
+    """把主号 Codex 认证文件推送到所有已启用的远端目标。"""
     results = {}
     enabled_targets = get_enabled_sync_targets()
-
-    if SYNC_TARGET_CPA in enabled_targets:
-        from autoteam.cpa_sync import sync_main_codex_to_cpa
-
-        results[SYNC_TARGET_CPA] = sync_main_codex_to_cpa(filepath)
 
     if SYNC_TARGET_SUB2API in enabled_targets:
         from autoteam.sub2api_sync import sync_main_codex_to_sub2api
@@ -146,13 +135,9 @@ def sync_main_codex_to_configured_targets(filepath: str):
 
 
 def delete_main_codex_from_configured_targets(*, include_disabled: bool = False):
+    """从所有已启用(或可用)的远端目标删除主号 Codex 认证文件。"""
     results = {}
     targets = get_available_sync_targets() if include_disabled else get_enabled_sync_targets()
-
-    if SYNC_TARGET_CPA in targets:
-        from autoteam.cpa_sync import delete_main_codex_from_cpa
-
-        results[SYNC_TARGET_CPA] = delete_main_codex_from_cpa()
 
     if SYNC_TARGET_SUB2API in targets:
         from autoteam.sub2api_sync import delete_main_codex_from_sub2api
@@ -165,25 +150,17 @@ def delete_main_codex_from_configured_targets(*, include_disabled: bool = False)
 def delete_account_from_configured_targets(
     email: str, *, auth_names: list[str] | None = None, include_disabled: bool = False
 ):
+    """从所有已启用(或可用)的远端目标删除指定账号的认证文件。"""
     results = {}
     targets = get_available_sync_targets() if include_disabled else get_enabled_sync_targets()
-
-    if SYNC_TARGET_CPA in targets:
-        from autoteam.cpa_sync import delete_from_cpa, list_cpa_files
-
-        deleted = []
-        auth_name_set = set(auth_names or [])
-        for item in list_cpa_files():
-            item_email = (item.get("email") or "").lower()
-            item_name = item.get("name") or ""
-            if item_email == email.lower() or item_name in auth_name_set:
-                if delete_from_cpa(item_name):
-                    deleted.append(item_name)
-        results[SYNC_TARGET_CPA] = {"deleted": deleted, "count": len(deleted)}
 
     if SYNC_TARGET_SUB2API in targets:
         from autoteam.sub2api_sync import delete_account_from_sub2api
 
-        results[SYNC_TARGET_SUB2API] = delete_account_from_sub2api(email, auth_names=auth_names or [])
+        try:
+            results[SYNC_TARGET_SUB2API] = delete_account_from_sub2api(email, auth_names=auth_names or [])
+        except Exception as exc:
+            logger.warning("[Sub2API] 删除 %s 时异常,跳过: %s", email, exc)
+            results[SYNC_TARGET_SUB2API] = {"deleted": [], "count": 0, "error": str(exc)}
 
     return results

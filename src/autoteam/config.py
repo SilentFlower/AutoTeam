@@ -70,10 +70,6 @@ CF_TEMP_EMAIL_DOMAIN = os.environ.get("CF_TEMP_EMAIL_DOMAIN", "")
 # ChatGPT Team 配置
 CHATGPT_ACCOUNT_ID = os.environ.get("CHATGPT_ACCOUNT_ID", "")
 
-# CPA (CLIProxyAPI) 配置
-CPA_URL = os.environ.get("CPA_URL", "")
-CPA_KEY = os.environ.get("CPA_KEY", "")
-
 # Sub2API 配置
 SUB2API_URL = os.environ.get("SUB2API_URL", "")
 SUB2API_EMAIL = os.environ.get("SUB2API_EMAIL", "")
@@ -100,6 +96,23 @@ API_KEY = os.environ.get("API_KEY", "")
 AUTO_CHECK_INTERVAL = _get_int_env("AUTO_CHECK_INTERVAL", 300)  # 巡检间隔（秒），默认 5 分钟
 AUTO_CHECK_THRESHOLD = _get_int_env("AUTO_CHECK_THRESHOLD", 10)  # 额度低于此百分比触发轮转，默认 10%
 AUTO_CHECK_MIN_LOW = _get_int_env("AUTO_CHECK_MIN_LOW", 2)  # 至少几个账号低于阈值才触发，默认 2
+
+# HeroSMS 接码服务配置（兼容 SMS-Activate 协议）
+# 仅在需要自动通过 OpenAI 手机号验证页时使用；未填 API_KEY 则功能关闭
+HERO_SMS_BASE_URL = os.environ.get("HERO_SMS_BASE_URL", "https://hero-sms.com/stubs/handler_api.php").strip()
+HERO_SMS_API_KEY = os.environ.get("HERO_SMS_API_KEY", "").strip()
+# hero-sms 上 OpenAI 的服务代码是 ``dr``(不是 SMS-Activate 行业惯例的 ``oai``)
+HERO_SMS_SERVICE = os.environ.get("HERO_SMS_SERVICE", "dr").strip() or "dr"
+# hero-sms 自家国家 ID 与 SMS-Activate 标准不同; 187=USA、0=Russia、3=China
+HERO_SMS_COUNTRY = os.environ.get("HERO_SMS_COUNTRY", "187").strip() or "187"
+HERO_SMS_OPERATOR = os.environ.get("HERO_SMS_OPERATOR", "").strip()
+HERO_SMS_MAX_PRICE = _get_float_env("HERO_SMS_MAX_PRICE", 0)
+HERO_SMS_HTTP_TIMEOUT = _get_int_env("HERO_SMS_HTTP_TIMEOUT", 30)
+HERO_SMS_WAIT_SECONDS = _get_int_env("HERO_SMS_WAIT_SECONDS", 180)
+# 一个号码最多被复用多少次成功验证后停止复用(0 表示不限)
+HERO_SMS_PHONE_REUSE_MAX = _get_int_env("HERO_SMS_PHONE_REUSE_MAX", 3)
+# 强制每次都申请新号码(关闭号码复用), 用于已知缓存号码已废、想立刻换号的情况
+HERO_SMS_FORCE_NEW_PHONE = _get_bool_env("HERO_SMS_FORCE_NEW_PHONE", False)
 
 # Playwright 代理配置
 PLAYWRIGHT_PROXY_URL = os.environ.get("PLAYWRIGHT_PROXY_URL", "").strip()
