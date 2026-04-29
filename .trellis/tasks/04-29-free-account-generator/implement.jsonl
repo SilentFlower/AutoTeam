@@ -1,0 +1,9 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "项目快照：Python/FastAPI/JSON 持久化/Vue 3 前端，所有约定从这里出发"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "新建 src/autoteam/free_accounts.py、data/free_accounts.json、web FreePage.vue 都要遵循扁平结构铁律"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "新增 free_accounts.json 的读写要遵循现有 JSON 模式（向后兼容、状态枚举、字段命名）"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "F1b/F2/F3 三种失败路径要按规范用 RuntimeError/HTTPException + 中文 detail 上报，不吞错"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "[免费号] 日志前缀、%s 占位、密码/token 不入日志的脱敏红线"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Ruff/pytest/pre-commit 跑通的硬要求"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "本任务大量复用 _run_invite_login_flow / remove_from_team / delete_managed_account / sub2api_sync 现成逻辑，必读"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "跨层数据流 前端FreePage→/api/free/*→free_accounts.py→sub2api/cloudmail 远端，要保证一致性"}
+{"file": ".trellis/tasks/04-29-free-account-generator/prd.md", "reason": "本任务的 PRD，包含 D1-D5 锁定决策、Requirements、Acceptance、Out of Scope、技术路径"}

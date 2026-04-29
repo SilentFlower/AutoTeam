@@ -121,3 +121,56 @@ PR1 后端 admin_registry + 数据层按主号目录隔离 + 首次启动自动�
 ### Next Steps
 
 - None - task complete
+
+---
+
+## 2026-04-29 — 免费号生成器 PR1
+
+**任务**: `.trellis/tasks/04-29-free-account-generator/`
+**当前状态**: PR1 后端核心已落地 + check-all 通过 + PRD 已同步
+
+### Brainstorm 结果(D1-D5 锁定)
+
+- **D1**: 走完整 invite + Codex OAuth,拿 auth_file(不只要邮箱密码)
+- **D2**: 完全独立 — `data/free_accounts.json` + `FreePage.vue` + `/api/free/*`
+- **D3**: sub2api 同 group(不引入新配置)
+- **D4**: 纯静态生命周期(不起后台巡检)
+- **D5**: 稳健 MVP — F1(b) 半成品落库 + F2 二次确认 + F3 级联删除
+
+### PR1 产出
+
+- 新建 `src/autoteam/free_accounts.py`(700 行,数据层 + cmd_generate + check_quota + delete)
+- 新建 `tests/unit/test_free_accounts.py`(33 测试,全绿)
+- 新建 `data/free_accounts.json`(`[]`)
+- **回归对比**: 不带 PR1 = 36F/175P,带 PR1 = 36F/208P → **0 回归**
+- baseline 36 failed 是 multi-admin 既有问题,未 commit 的旧改动遗留
+
+### 关键技术决策(已写入 PRD)
+
+- **不直接复用 `manager._run_invite_login_flow`** — 它写 accounts.json 与 D2 隔离铁律冲突,改为直接调底层 `invite.login_with_invite` + `_login_codex_with_result` + `save_auth_file`
+- **`team_residue` 是独立布尔字段**,与 status(active/auth_failed/exhausted)正交 — 一个账号可同时 OAuth 成功 + 移出失败
+- **`check_free_quota` 内置 401 自动刷新 token**(参考 manager._check_and_refresh)
+- **`delete_free_account` 返回固定 cleanup 摘要 dict**(为 PR3 接前端做前向兼容)
+
+### check-all 三步结果
+
+- ✅ Step 1 PRD 实现核对: 0 偏差(在 PR1 范围内)
+- ✅ Step 2 假设验证: API 签名 / 隔离铁律 全部成立
+- ✅ Step 3 spec 合规: 自修 4 个 cosmetic 问题(死常量 + 2 docstring + 2 测试),lint/format/pytest 全绿
+
+### sync-prd 完成
+
+PRD 与 PR1 实际实现 100% 对齐:
+- M1: D1/D2/R3/Decision/复用表/Technical Notes 多处把"复用 `_run_invite_login_flow`"改为"直接调底层组合"
+- M2: R2 schema status 候选 4→3 + team_residue 改成独立布尔字段
+- M3: R2 schema mail_provider 改为通用(取 mail_client.provider_name)
+- A1/A2/A3: 把 401 自动刷新 / cleanup 摘要字段 / add_free 自动补默认值补到 R5/R4/R1
+- 末尾加 "变更记录" 章节,按 sync-prd 模板格式记录
+
+### 下一步候选
+
+1. 先 commit PR1(干净回退点) → 再开 PR2(sub2api 参数化)
+2. 直接接 PR2
+3. 处理 multi-admin 那 36 个 baseline failed
+
+倾向 1。等用户决定。

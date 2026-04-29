@@ -1,0 +1,8 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "项目质量基线，检查代码是否符合 Python/FastAPI/JSON/Vue 3 的整体约定"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Ruff lint/format + pytest 必跑，pre-commit 必过"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "检查 F1b/F2/F3 错误处理是否符合规范（不吞错、HTTPException 中文 detail、RuntimeError 重抛）"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "检查日志前缀 [免费号]、%s 占位、敏感信息（password、token）未入日志"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "检查 free_accounts.json schema 与字段命名是否与现有 JSON 模式一致"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "检查是否有重复造轮子（应复用 _run_invite_login_flow / remove_from_team / delete_managed_account 等）"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "检查 前端 → API → 数据层 → 远端 各层数据契约一致性"}
+{"file": ".trellis/tasks/04-29-free-account-generator/prd.md", "reason": "对照 PRD 的 Acceptance Criteria + Out of Scope 验收"}
