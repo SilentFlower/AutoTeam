@@ -89,6 +89,7 @@ defineEmits(['navigate', 'refresh', 'logout'])
 const items = [
   { key: 'workbench', icon: '🎛️', label: '工作台', mobileLabel: '工作台', hint: '统一查看与操作当前主号' },
   { key: 'free', icon: '🎁', label: 'FREE 池', mobileLabel: 'FREE', hint: '免费号生成与管理（隔离 active 池）' },
+  { key: 'plus', icon: '💎', label: 'Plus 池', mobileLabel: 'Plus', hint: '导入 Plus 号并同步 sub2api' },
   { key: 'config', icon: '🧩', label: '配置面板', mobileLabel: '配置', hint: '统一编辑系统配置' },
   { key: 'tasks', icon: '📜', label: '任务历史', mobileLabel: '任务', hint: '追踪任务执行结果' },
   { key: 'logs', icon: '📋', label: '日志', mobileLabel: '日志', hint: '查看实时运行日志' },

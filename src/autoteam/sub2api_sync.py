@@ -6,17 +6,23 @@ PRD ``04-29-free-account-generator`` 引入"免费号(FREE)池"后,本模块负�
 - 新增 ``sync_free_to_sub2api()`` 入口,从 ``free_accounts.json`` 读 ``status=active``
   的免费号同步到**同一个** ``SUB2API_GROUP``(D3 锁定:不引入独立 FREE group)。
 
-为了保证两边互不误删(D2 隔离铁律),"删除非本端账号"分支判断"应保留"集合时
-取的是 active + FREE 两边邮箱的**并集**——只要这条远端账号对应的邮箱在任意一个
+PRD ``04-30-plus-account-pool-oauth`` 引入 Plus 池后,新增
+``sync_plus_to_sub2api()`` 入口,从 ``plus_accounts.json`` 读 ``status=active``
+的 Plus 号同步到 sub2api,远端用 ``autoteam_kind=plus`` 独立标记。
+
+为了保证三池互不误删(D2 隔离铁律),"删除非本端账号"分支判断"应保留"集合时
+取的是 active + FREE + Plus 三边邮箱的**并集**——只要这条远端账号对应的邮箱在任意一个
 本地数据源里出现过,就视为"已被某一边管理",不删。
 """
 
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import logging
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -45,9 +51,11 @@ logger = logging.getLogger(__name__)
 
 # 同步源标识:对应 ``_collect_managed_targets`` 的 ``source`` 入参。
 # - ``pool``: 现有 active 池(``accounts.json`` 中 ``status=active``);
-# - ``free``: PRD 新增的免费号池(``free_accounts.json`` 中 ``status=active``)。
+# - ``free``: PRD 新增的免费号池(``free_accounts.json`` 中 ``status=active``);
+# - ``plus``: PRD 新增的 Plus 池(``plus_accounts.json`` 中 ``status=active``)。
 SOURCE_POOL = "pool"
 SOURCE_FREE = "free"
+SOURCE_PLUS = "plus"
 
 _TIMEOUT = 10
 _PAGE_SIZE = 200
@@ -62,6 +70,7 @@ _EXTRA_GROUP_IDS = "autoteam_sub2api_group_ids"
 _EXTRA_GROUP_NAMES = "autoteam_sub2api_group_names"
 
 _KIND_POOL = "pool"
+_KIND_PLUS = "plus"
 _KIND_MAIN = "main"
 
 _REMOTE_AUTH_FILE_PREFIX = "sub2api-"
@@ -751,7 +760,20 @@ def verify_sub2api_connection() -> bool:
         return False
 
 
-def _collect_managed_targets(source: Literal["pool", "free"]) -> dict[str, dict]:
+def _call_source_loader(loader: Callable, admin_id: str | None):
+    """调用数据源 loader，支持可选 admin_id 透传。"""
+    try:
+        sig = inspect.signature(loader)
+    except (TypeError, ValueError):
+        sig = None
+    if admin_id is not None and sig is not None:
+        params = sig.parameters
+        if "admin_id" in params or any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+            return loader(admin_id=admin_id)
+    return loader()
+
+
+def _collect_managed_targets(source: Literal["pool", "free", "plus"], admin_id: str | None = None) -> dict[str, dict]:
     """按 source 枚举本地需要同步到 sub2api 的账号目标。
 
     PRD R6 抽参点:把原来 ``sync_to_sub2api`` 里"枚举 active 账号"那段代码独立成
@@ -761,7 +783,9 @@ def _collect_managed_targets(source: Literal["pool", "free"]) -> dict[str, dict]
     每个 target dict 包含 ``email / name / auth_path / auth_data / quota_info``。
 
     :param source: ``"pool"`` 走 ``accounts.load_accounts()`` + ``status=active``;
-        ``"free"`` 走 ``free_accounts.load_free()`` + ``status=active``。
+        ``"free"`` 走 ``free_accounts.load_free()`` + ``status=active``;
+        ``"plus"`` 走 ``plus_accounts.load_plus()`` + ``status=active``。
+    :param admin_id: 目标 admin_id；用于后台线程中显式固定数据目录。
     :return: ``{email_lower: target_dict}`` 字典;auth_file 不存在或读取失败的条目
         会被跳过并写 warning 日志,不阻塞其余条目同步。
     """
@@ -771,15 +795,21 @@ def _collect_managed_targets(source: Literal["pool", "free"]) -> dict[str, dict]
         # 局部 import 避免顶部循环依赖(accounts → admin_state → ...)
         from autoteam.accounts import STATUS_ACTIVE, load_accounts
 
-        records = load_accounts()
+        records = _call_source_loader(load_accounts, admin_id)
         active_status = STATUS_ACTIVE
         log_label = "active 账号"
     elif source == SOURCE_FREE:
         from autoteam.free_accounts import FREE_STATUS_ACTIVE, load_free
 
-        records = load_free()
+        records = _call_source_loader(load_free, admin_id)
         active_status = FREE_STATUS_ACTIVE
         log_label = "FREE 账号"
+    elif source == SOURCE_PLUS:
+        from autoteam.plus_accounts import PLUS_STATUS_ACTIVE, load_plus
+
+        records = _call_source_loader(load_plus, admin_id)
+        active_status = PLUS_STATUS_ACTIVE
+        log_label = "Plus 账号"
     else:
         raise ValueError(f"[Sub2API] 未知同步来源: {source}")
 
@@ -811,11 +841,11 @@ def _collect_managed_targets(source: Literal["pool", "free"]) -> dict[str, dict]
     return targets
 
 
-def _collect_all_managed_emails() -> set[str]:
-    """收集 active + FREE 两边的本地邮箱并集(任何 status,任何 auth_file 状态)。
+def _collect_all_managed_emails(admin_id: str | None = None) -> set[str]:
+    """收集 active + FREE + Plus 三边的本地邮箱并集(任何 status,任何 auth_file 状态)。
 
     PRD"数据隔离的执行方式"第 3 条要求:sub2api 同步在删除"非本端账号"分支时,
-    需要看到 active + FREE 两边的并集做"应保留"判断。这里返回的是**限定符**:
+    需要看到 active + FREE + Plus 三边的并集做"应保留"判断。这里返回的是**限定符**:
     "我们历史上管过的邮箱集合",原 ``sync_to_sub2api`` 中 ``local_emails`` 的并集版。
 
     保留原 ``local_emails`` 语义:不管 status / auth_file,只要邮箱出现过即算"管过"。
@@ -829,7 +859,7 @@ def _collect_all_managed_emails() -> set[str]:
     try:
         from autoteam.accounts import load_accounts
 
-        for acc in load_accounts():
+        for acc in _call_source_loader(load_accounts, admin_id):
             email = str(acc.get("email") or "").strip().lower()
             if email:
                 emails.add(email)
@@ -839,18 +869,28 @@ def _collect_all_managed_emails() -> set[str]:
     try:
         from autoteam.free_accounts import load_free
 
-        for rec in load_free():
+        for rec in _call_source_loader(load_free, admin_id):
             email = str(rec.get("email") or "").strip().lower()
             if email:
                 emails.add(email)
     except Exception as exc:
         logger.warning("[Sub2API] 收集 FREE 池邮箱失败,跳过该侧并集: %s", exc)
 
+    try:
+        from autoteam.plus_accounts import load_plus
+
+        for rec in _call_source_loader(load_plus, admin_id):
+            email = str(rec.get("email") or "").strip().lower()
+            if email:
+                emails.add(email)
+    except Exception as exc:
+        logger.warning("[Sub2API] 收集 Plus 池邮箱失败,跳过该侧并集: %s", exc)
+
     return emails
 
 
-def _collect_active_status_emails() -> set[str]:
-    """收集 active 池 + FREE 池中 status=active 的邮箱并集。
+def _collect_active_status_emails(admin_id: str | None = None) -> set[str]:
+    """收集 active 池 + FREE 池 + Plus 池中 status=active 的邮箱并集。
 
     与 :func:`_collect_managed_targets` 的差异:
     - ``_collect_managed_targets`` 还会校验 auth_file 存在并能加载,用于拼 sync payload;
@@ -866,7 +906,7 @@ def _collect_active_status_emails() -> set[str]:
     try:
         from autoteam.accounts import STATUS_ACTIVE, load_accounts
 
-        for acc in load_accounts():
+        for acc in _call_source_loader(load_accounts, admin_id):
             if acc.get("status") != STATUS_ACTIVE:
                 continue
             email = str(acc.get("email") or "").strip().lower()
@@ -878,7 +918,7 @@ def _collect_active_status_emails() -> set[str]:
     try:
         from autoteam.free_accounts import FREE_STATUS_ACTIVE, load_free
 
-        for rec in load_free():
+        for rec in _call_source_loader(load_free, admin_id):
             if rec.get("status") != FREE_STATUS_ACTIVE:
                 continue
             email = str(rec.get("email") or "").strip().lower()
@@ -887,44 +927,59 @@ def _collect_active_status_emails() -> set[str]:
     except Exception as exc:
         logger.warning("[Sub2API] 收集 FREE 池 active 状态邮箱失败,跳过该侧: %s", exc)
 
+    try:
+        from autoteam.plus_accounts import PLUS_STATUS_ACTIVE, load_plus
+
+        for rec in _call_source_loader(load_plus, admin_id):
+            if rec.get("status") != PLUS_STATUS_ACTIVE:
+                continue
+            email = str(rec.get("email") or "").strip().lower()
+            if email:
+                emails.add(email)
+    except Exception as exc:
+        logger.warning("[Sub2API] 收集 Plus 池 active 状态邮箱失败,跳过该侧: %s", exc)
+
     return emails
 
 
-def sync_to_sub2api(source: Literal["pool", "free"] = SOURCE_POOL):
+def sync_to_sub2api(source: Literal["pool", "free", "plus"] = SOURCE_POOL, admin_id: str | None = None):
     """把指定 source 的本地账号同步到 Sub2API。
 
     历史调用方(``sync_targets.sync_to_configured_targets`` / ``manager.cmd_*``)
     无需改动,默认 ``source="pool"`` 维持 active 池的原有行为。新调用方走
-    :func:`sync_free_to_sub2api` 同步免费号池。
+    :func:`sync_free_to_sub2api` 同步免费号池,走 :func:`sync_plus_to_sub2api`
+    同步 Plus 池。
 
     与原内联实现的关键差异:
 
     - "枚举 active 账号"那段代码抽到 :func:`_collect_managed_targets`,按 source 分流;
-    - 删除分支判定"应保留"集合用 :func:`_collect_active_status_emails`(active+FREE
-      两边 status=active 邮箱并集),避免互删(PRD"数据隔离的执行方式"第 3 条):
+    - 删除分支判定"应保留"集合用 :func:`_collect_active_status_emails`(active+FREE+Plus
+      三池 status=active 邮箱并集),避免互删(PRD"数据隔离的执行方式"第 3 条):
         * active 同步时 FREE 池里的 active 账号被并集保护,不被当孤儿删;
         * FREE 同步时 active 池里的 active 账号被并集保护,不被当孤儿删;
-    - 删除范围限定符 ``all_local_emails``(active+FREE 任意状态邮箱并集)保留原行为
+        * Plus 同步时 active / FREE 池里的 active 账号同样被并集保护;
+    - 删除范围限定符 ``all_local_emails``(active+FREE+Plus 任意状态邮箱并集)保留原行为
       "只删我们以前同步过的"语义,防止误删第三方账号;
     - 日志中的 ``active 账号``/``FREE 账号`` 文案随 source 切换,便于排障定位。
     """
-    managed_targets = _collect_managed_targets(source)
+    managed_targets = _collect_managed_targets(source, admin_id=admin_id)
     # 删除分支用并集,确保跨 source 互不误删:
-    # - all_local_emails(active+FREE 任意状态)= 限定"我们以前管过的邮箱"——保留原行为
+    # - all_local_emails(active+FREE+Plus 任意状态)= 限定"我们以前管过的邮箱"——保留原行为
     #   语义"只删我们以前同步过的",防止误删第三方账号;
-    # - keep_emails(active+FREE 中 status=active)= 当前应保留的邮箱并集——FREE 上线后
+    # - keep_emails(active+FREE+Plus 中 status=active)= 当前应保留的邮箱并集——FREE/Plus 上线后
     #   active 同步要保护 FREE 池的 active 账号不被当孤儿删,反向亦然;
     #   特意走 _collect_active_status_emails 而不复用 _collect_managed_targets,
     #   因为后者会校验 auth_file 存在,我们不想让"暂时丢 auth_file 的 active 记录"
     #   失去远端保护。
-    all_local_emails = _collect_all_managed_emails()
-    keep_emails = _collect_active_status_emails()
-    source_label = "FREE" if source == SOURCE_FREE else "active"
+    all_local_emails = _collect_all_managed_emails(admin_id=admin_id)
+    keep_emails = _collect_active_status_emails(admin_id=admin_id)
+    source_label = "FREE" if source == SOURCE_FREE else "Plus" if source == SOURCE_PLUS else "active"
+    managed_kind = _KIND_PLUS if source == SOURCE_PLUS else _KIND_POOL
 
     token = _login()
     group_ids, group_names = _resolve_group_binding(token)
     remote_accounts = _list_openai_oauth_accounts(token)
-    existing_by_email, duplicates_deleted = _dedupe_managed_accounts(token, remote_accounts, kind=_KIND_POOL)
+    existing_by_email, duplicates_deleted = _dedupe_managed_accounts(token, remote_accounts, kind=managed_kind)
 
     logger.info(
         "[Sub2API] %s 账号: %d, Sub2API 管理账号: %d",
@@ -949,7 +1004,7 @@ def sync_to_sub2api(source: Literal["pool", "free"] = SOURCE_POOL):
         desired_extra = _build_extra(
             email,
             target["auth_path"].name,
-            kind=_KIND_POOL,
+            kind=managed_kind,
             quota_info=target.get("quota_info"),
         )
         _attach_group_metadata(desired_extra, group_ids, group_names)
@@ -1003,16 +1058,16 @@ def sync_to_sub2api(source: Literal["pool", "free"] = SOURCE_POOL):
 
     for email, account in existing_by_email.items():
         # 关键约束:用并集判断"应保留",避免互删。
-        # - all_local_emails(active+FREE 任意状态)= 我们历史管过的邮箱集合,作为限定符
+        # - all_local_emails(active+FREE+Plus 任意状态)= 我们历史管过的邮箱集合,作为限定符
         #   保留原行为的"只删我们以前管过的邮箱"语义;
-        # - keep_emails(active+FREE 的 active 状态)= 当前应保留的邮箱,只要在这里就跳过删除。
+        # - keep_emails(active+FREE+Plus 的 active 状态)= 当前应保留的邮箱,只要在这里就跳过删除。
         if email in all_local_emails and email not in keep_emails:
             _delete_account(token, account, label="删除非 active 账号")
             logger.info("[Sub2API] 删除非 active 账号: %s", email)
             deleted += 1
 
     final_accounts = _list_openai_oauth_accounts(token)
-    final_managed = [item for item in final_accounts if _is_managed_account(item, kind=_KIND_POOL)]
+    final_managed = [item for item in final_accounts if _is_managed_account(item, kind=managed_kind)]
     logger.info(
         "[Sub2API] 同步完成: 创建 %d, 更新 %d, 删除 %d, 远端去重 %d",
         created,
@@ -1029,7 +1084,7 @@ def sync_to_sub2api(source: Literal["pool", "free"] = SOURCE_POOL):
     }
 
 
-def sync_free_to_sub2api():
+def sync_free_to_sub2api(admin_id: str | None = None):
     """免费号池 → Sub2API 同步入口(PRD R6 新增)。
 
     与 :func:`sync_to_sub2api` 共用底层逻辑,仅切换 source 与日志文案;
@@ -1039,7 +1094,15 @@ def sync_free_to_sub2api():
     - ``free_accounts.cmd_generate_free_account`` 生成成功后自动触发;
     - PR3 在 FreePage"手动同步"按钮触发(``/api/free/sync_sub2api``)。
     """
-    return sync_to_sub2api(source=SOURCE_FREE)
+    return sync_to_sub2api(source=SOURCE_FREE, admin_id=admin_id)
+
+
+def sync_plus_to_sub2api(admin_id: str | None = None):
+    """Plus 池 → Sub2API 同步入口(PRD 04-30-plus-account-pool-oauth)。
+
+    :return: ``sync_to_sub2api(source="plus")`` 的同步摘要。
+    """
+    return sync_to_sub2api(source=SOURCE_PLUS, admin_id=admin_id)
 
 
 def sync_main_codex_to_sub2api(filepath):
@@ -1049,7 +1112,7 @@ def sync_main_codex_to_sub2api(filepath):
 
     - 数据源是单个 ``filepath`` 文件(每个 admin 各自管理自己的 ``codex-main-*.json``,
       见 :func:`autoteam.codex_auth.save_main_auth_file`),不走本地 pool/free JSON;
-    - kind 写 ``main``,与 pool 池 / FREE 池在 sub2api 远端按 ``_EXTRA_KIND`` 区分;
+    - kind 写 ``main``,与 pool 池 / FREE 池 / Plus 池在 sub2api 远端按 ``_EXTRA_KIND`` 区分;
     - 多 admin 共用同一个 sub2api 实例时,每个 admin 的主号邮箱不同,
       由 :func:`_dedupe_managed_accounts` 按 email 归集——**不删跨邮箱的他人主号**
       (修复 `04-29-sub2api-main-sync-fix`:历史实现按"主号是单例"假设把所有
@@ -1138,14 +1201,21 @@ def delete_main_codex_from_sub2api():
     return {"deleted": deleted, "count": len(deleted)}
 
 
-def delete_account_from_sub2api(email: str, *, auth_names: list[str] | None = None):
+def _delete_managed_account_from_sub2api(email: str, *, kind: str, auth_names: list[str] | None = None):
+    """按 autoteam kind 删除 sub2api 远端账号。
+
+    :param email: 目标邮箱。
+    :param kind: 远端 ``autoteam_kind`` 标记。
+    :param auth_names: 可选 auth 文件名候选，用于文件名兜底匹配。
+    :return: ``{"deleted": list, "count": int}`` 删除摘要。
+    """
     token = _login()
     remote_accounts = _list_openai_oauth_accounts(token)
     auth_name_set = _remote_auth_file_candidates(auth_names)
     deleted = []
 
     for item in remote_accounts:
-        if not _is_managed_account(item, kind=_KIND_POOL):
+        if not _is_managed_account(item, kind=kind):
             continue
         item_email = _managed_email(item)
         item_auth_name = _managed_auth_file(item)
@@ -1155,3 +1225,11 @@ def delete_account_from_sub2api(email: str, *, auth_names: list[str] | None = No
         deleted.append(item.get("name") or str(item.get("id")))
 
     return {"deleted": deleted, "count": len(deleted)}
+
+
+def delete_account_from_sub2api(email: str, *, auth_names: list[str] | None = None):
+    return _delete_managed_account_from_sub2api(email, kind=_KIND_POOL, auth_names=auth_names)
+
+
+def delete_plus_account_from_sub2api(email: str, *, auth_names: list[str] | None = None):
+    return _delete_managed_account_from_sub2api(email, kind=_KIND_PLUS, auth_names=auth_names)

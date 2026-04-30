@@ -10,7 +10,8 @@
 
 | 文件 | 用途 | 写入位置 |
 |------|------|--------|
-| `accounts.json`（项目根） | 账号池（每个账号是一条 dict） | `src/autoteam/accounts.py:39-41` |
+| `accounts.json`（项目根或 `data/admins/<admin_id>/`） | active 账号池（每个账号是一条 dict） | `src/autoteam/accounts.py` |
+| `free_accounts.json` / `plus_accounts.json` | 完全隔离的 FREE / Plus 资产池 | `src/autoteam/free_accounts.py` / `src/autoteam/plus_accounts.py` |
 | `state.json`（项目根） | 管理员登录态、向导进度 | `src/autoteam/admin_state.py` |
 | `.env`（项目根） | 全局配置（API Key、邮箱凭证、同步目标等） | `src/autoteam/config.py` + `src/autoteam/api.py` 热加载 |
 
@@ -18,7 +19,7 @@
 
 - 文本编码统一通过 `autoteam.textio.read_text` / `write_text` 完成（UTF-8，读时兼容 BOM `utf-8-sig`，写时纯 UTF-8）。
 - JSON 序列化统一 `json.dumps(..., indent=2, ensure_ascii=False)`——保留中文可读、缩进 2 空格。
-- 任何要持久化的字段一律写到现有 JSON 文件的对应 dict 里，**不要**再开新文件。
+- 任何要持久化的字段一律写到现有 JSON 文件的对应 dict 里，**不要**再开新文件；完全隔离资产池的例外见下方专章。
 
 ---
 
@@ -343,20 +344,83 @@ def bootstrap_owner_registry():
 2. **字段集差异显著**——新池字段（如 `team_residue` / `last_quota` / `mail_account_id`）只在新流程消费，混入旧 JSON 增加 schema 噪音
 3. **数据生命周期不同**——新池纯静态用户驱动（无后台轮询），旧池有自动巡检；混在一起会让 `_normalize_record` / 状态机制相互干扰
 
-### 真例：FREE 池 `data/free_accounts.json`（task `04-29-free-account-generator` D2 决策）
+### 真例：FREE 池与 Plus 池（task `04-29-free-account-generator` / `04-30-plus-account-pool-oauth`）
 
 ```
 data/
-├── accounts.json           # active 池(原)
-└── free_accounts.json      # FREE 池(新增,与 active 池零交集)
+└── admins/
+    └── <admin_id>/
+        ├── accounts.json        # active 池
+        ├── free_accounts.json   # FREE 池,与 active 池零交集
+        └── plus_accounts.json   # Plus 池,与 active / FREE 池零交集
 ```
 
 **实施约束**：
 
 - 数据层 `load_*/save_*/find_*/add_*/update_*/delete_*` 仿 `accounts.py` 范式，不再造轮子
 - `_normalize_record()` 入库时按 schema 补默认值，避免读取处 `KeyError`
-- 跨池同步模块（如 `sub2api_sync`）参数化数据来源 + **双向并集去重**避免互删，参考 `_collect_managed_targets(source: Literal["pool","free"])` + `_collect_active_status_emails()` 取两边并集
+- 跨池同步模块（如 `sub2api_sync`）参数化数据来源 + **并集保护**避免互删，参考 `_collect_managed_targets(source: Literal["pool","free","plus"])` + `_collect_all_managed_emails()` / `_collect_active_status_emails()` 取 active + FREE + Plus 三池并集
 - PRD 必须显式锁定隔离决策（ADR 形式），不能口头同意
+
+### Scenario: Plus 池 OAuth + sub2api 三池隔离契约
+
+#### 1. Scope / Trigger
+
+- Trigger: 新增用户导入的 Plus 号池，流程跨越 JSON 存储、Codex OAuth、HeroSMS 接码、FastAPI、Vue 页面和 sub2api 同步。
+- Scope: Plus 池必须独立于 active 池和 FREE 池；active/FREE 的 `cmd_check`、`cmd_rotate`、`cmd_fill`、`cmd_cleanup` 不得读取或写入 Plus 池。
+
+#### 2. Signatures
+
+- 数据层：`load_plus(admin_id=None) -> list[dict]`、`save_plus(records, admin_id=None) -> None`、`find_plus(records, email) -> dict | None`、`import_plus_account(email, password, admin_id=None) -> dict`、`reauth_plus_account(email, admin_id=None) -> dict`、`check_plus_quota(emails=None, admin_id=None) -> dict[str, str]`、`delete_plus_account(email, admin_id=None, cleanup_remote=True) -> dict`。
+- API：`POST /api/plus/import`、`GET /api/plus/list`、`POST /api/plus/check_quota`、`POST /api/plus/sync_sub2api`、`POST /api/plus/{email}/reauth`、`DELETE /api/plus/{email}`。
+- sub2api：`sync_to_sub2api(source: Literal["pool","free","plus"], admin_id=None)`、`sync_plus_to_sub2api(admin_id=None)`、`delete_plus_account_from_sub2api(email, auth_names=None)`。
+
+#### 3. Contracts
+
+- 存储路径：当前 admin 写 `data/admins/<admin_id>/plus_accounts.json`；无激活 admin 时只允许回退到 `data/plus_accounts.json` 兼容测试/单实例路径。
+- Plus 记录字段：`email`、`password`、`auth_file`、`status`、`plan_type`、`last_error`、`created_at`、`last_login_at`、`last_quota`、`last_quota_at`、`last_sub2api_synced_at`。
+- 状态值：`active`、`auth_failed`、`plan_mismatch`、`exhausted`，必须用 `PLUS_STATUS_*` 常量，不散落字符串。
+- OAuth：调用 `manager._login_codex_with_result(..., allow_non_team=True)`；手机号验证由 `codex_auth` 检测 `phone-verification` / `add-phone` 后调用 HeroSMS。
+- Plus 校验：OAuth 成功后只有 `plan_type in {"plus", "chatgpt_plus"}` 才能保存 auth 文件并进入 `active`；非 Plus 进入 `plan_mismatch`。
+- sub2api：Plus 远端必须写 `extra.autoteam_kind="plus"`；active/FREE 仍走 `"pool"`，主号走 `"main"`。删除分支必须用 active + FREE + Plus 三池邮箱并集做保护。
+- API 响应：`GET /api/plus/list` 返回明文 `password` 供操作者复制；此端点依赖 API Key 鉴权，日志和前端不得输出密码。
+
+#### 4. Validation & Error Matrix
+
+- 空 email / password -> `POST /api/plus/import` 返回 400；业务函数抛 `ValueError`。
+- 同邮箱正在导入或重授权 -> 业务函数抛 `RuntimeError`，避免同一账号并发 OAuth。
+- OAuth 失败 -> 记录 `status=auth_failed`、`last_error`，不保存 auth 文件，不自动推 sub2api。
+- OAuth 成功但非 Plus -> 记录 `status=plan_mismatch`，不保存 auth 文件，不自动推 sub2api。
+- `auth_file` 缺失或读失败 -> sub2api 同步跳过该条 payload；若记录仍是 `active`，删除保护并集仍保留远端账号。
+- 删除不存在的 Plus 号 -> API 返回 404；业务层删除函数对缺失记录返回 no-op cleanup。
+- sub2api 配置缺失 -> 导入、重授权、手动同步入口在启动任务前返回 400，提示去配置面板补齐。
+
+#### 5. Good/Base/Bad Cases
+
+- Good: 已有 Plus 邮箱/密码导入成功，保存 `codex-*.json`，记录变为 `active`，`sync_plus_to_sub2api()` 创建或更新 `autoteam_kind=plus` 远端。
+- Base: active/FREE/Plus 三池有同邮箱或历史远端残留时，同步任一池都只删除“本地曾管理但当前三池都非 active”的远端。
+- Bad: 把 Plus 写进 `accounts.json` 或用 `autoteam_kind=pool` 推送，会让 active/FREE 同步误判所有权，后续删除分支可能互删。
+
+#### 6. Tests Required
+
+- `tests/unit/test_plus_accounts.py`：CRUD 默认字段、Plus plan 成功入池、非 Plus plan 拒绝、删除清理 auth_file + sub2api。
+- `tests/unit/test_api_plus.py`：API 任务参数、列表响应包含 password、删除缺失记录 404。
+- `tests/unit/test_sub2api_sync.py`：`source="plus"` 只读 Plus 池、创建远端写 `autoteam_kind=plus`、三池并集防互删、Plus 删除只命中 plus kind。
+
+#### 7. Wrong vs Correct
+
+```python
+# ❌ Wrong:Plus 混入 active 池,并用 pool kind 同步
+accounts.add_account(email, password, status=STATUS_ACTIVE)
+sync_to_sub2api(source="pool")
+```
+
+```python
+# ✅ Correct:Plus 独立入池,OAuth 后按 plus kind 同步
+result = plus_accounts.import_plus_account(email, password, admin_id=admin_id)
+if result["status"] == plus_accounts.PLUS_STATUS_ACTIVE:
+    sub2api_sync.sync_plus_to_sub2api(admin_id=admin_id)
+```
 
 ### 反向：什么时候**不**该拆
 

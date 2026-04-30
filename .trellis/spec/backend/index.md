@@ -11,7 +11,7 @@
 - **HTTP 框架**：FastAPI（`src/autoteam/api.py`），Pydantic 入参校验。
 - **CLI 入口**：`autoteam = "autoteam.manager:main"`（见 `pyproject.toml:17`）。
 - **质量工具**：Ruff（lint + format）+ pytest + pre-commit。**没有** mypy / black / coverage。
-- **持久化**：仅 JSON 文件（`accounts.json`、`state.json`） + `.env`。**没有** SQL / ORM。
+- **持久化**：仅 JSON 文件（`accounts.json`、`free_accounts.json`、`plus_accounts.json`、`state.json`） + `.env`。**没有** SQL / ORM。
 - **日志**：标准 `logging` + `rich.logging.RichHandler`，全局在 `src/autoteam/__init__.py` 初始化。
 - **前端**：独立 Vue 3 + Vite，构建产物落到 `src/autoteam/web/dist/` 由 FastAPI 静态托管。
 
@@ -35,7 +35,7 @@
 
 1. **写实，不写理想**——以上规范全部基于 `src/autoteam/` 现有代码归纳。**当代码与规范冲突时**，先看是否是规范过期需要更新，再判断代码是否需要迁移；**不要悄悄按规范"修复"已有代码**。
 2. **新增功能优先复用既有模块** —— 见 `directory-structure.md` 的"模块组织原则"。
-3. **持久化优先合并到现有 JSON** —— 不要新建 `xxx.json`；能塞进 `accounts.json` 字段的就塞。
+3. **持久化优先合并到现有 JSON** —— 不要新建 `xxx.json`；能塞进 `accounts.json` 字段的就塞。完全隔离资产池例外见 `database-guidelines.md`。
 4. **错误信息中文 + 下一步指引** —— 用户面向的 `HTTPException.detail` 必须中文，且告诉用户该去哪做什么。
 5. **日志默认假设会被外发** —— 任何 token、密码、验证码、API Key、邮件正文都不进 logger。
 

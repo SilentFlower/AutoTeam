@@ -191,4 +191,15 @@ export const api = {
     // DELETE /api/free/{email} → 级联删除（auth_file + sub2api + cloudmail + JSON 条目）
     delete: (email) => request('DELETE', `/free/${encodeURIComponent(email)}`),
   },
+
+  // Plus 号池：用户导入已有 Plus 账号，后端自动走 Codex OAuth + HeroSMS 接码 + sub2api 同步。
+  // 响应包含明文 password（用于复制导入账号凭据）；前端切勿把 password 写日志或截图。
+  plus: {
+    importAccount: (email, password) => request('POST', '/plus/import', { email, password }),
+    list: () => request('GET', '/plus/list'),
+    checkQuota: (emails = null) => request('POST', '/plus/check_quota', { emails }),
+    syncSub2api: () => request('POST', '/plus/sync_sub2api'),
+    reauth: (email) => request('POST', `/plus/${encodeURIComponent(email)}/reauth`),
+    delete: (email) => request('DELETE', `/plus/${encodeURIComponent(email)}`),
+  },
 }

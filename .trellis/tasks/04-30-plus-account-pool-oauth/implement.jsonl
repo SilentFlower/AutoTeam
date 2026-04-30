@@ -1,0 +1,6 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/index.md", "reason": "后端规范索引：实现 Plus 池前需要按 checklist 读取具体规范"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "Plus 池独立 JSON 存储、跨池隔离和 sub2api 防互删策略"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "OAuth、接码、sub2api 同步失败的错误处理约定"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "OAuth token、验证码、密码等敏感信息日志脱敏约定"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "实现完成后的 Ruff、pytest 和编译自检要求"}

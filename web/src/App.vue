@@ -130,6 +130,11 @@
           :running-task="busyTask"
         />
 
+        <PlusPage
+          v-else-if="currentPage === 'plus'"
+          :running-task="busyTask"
+        />
+
         <ConfigPage
           v-else-if="currentPage === 'config'"
           :admin-status="adminStatus"
@@ -158,6 +163,7 @@ import Sidebar from './components/Sidebar.vue'
 import Workbench from './components/Workbench.vue'
 import ConfigPage from './components/ConfigPage.vue'
 import FreePage from './components/FreePage.vue'
+import PlusPage from './components/PlusPage.vue'
 import TaskHistoryPage from './components/TaskHistoryPage.vue'
 import LogViewer from './components/LogViewer.vue'
 import ThemeToggle from './components/ThemeToggle.vue'

@@ -27,6 +27,8 @@ AutoTeam/
 │   ├── api.py                     # FastAPI HTTP API，暴露 /api/* 端点 + 鉴权中间件
 │   ├── config.py                  # .env 加载、环境变量解析（_get_int_env 等）
 │   ├── accounts.py                # 账号池持久化（accounts.json 读写、状态枚举）
+│   ├── free_accounts.py           # FREE 池独立资产管理（free_accounts.json）
+│   ├── plus_accounts.py           # Plus 池独立资产管理（plus_accounts.json + OAuth）
 │   ├── account_ops.py             # 账号清理 / 远端对账（删邮箱、调 Team API、sync_targets）
 │   ├── admin_state.py             # 管理员登录态（state.json + 遗留 session 迁移）
 │   ├── codex_auth.py              # Codex OAuth、token 交换、额度检查
@@ -66,6 +68,7 @@ AutoTeam/
 | 情形 | 应该落的位置 |
 |------|------------|
 | 改动账号池字段或读写逻辑 | `accounts.py` |
+| 改动 FREE / Plus 独立资产池 | `free_accounts.py` / `plus_accounts.py` |
 | 新增 / 调整 HTTP 端点 | `api.py` |
 | 新增 CLI 子命令或主流程编排 | `manager.py` |
 | 新增第三方 API 客户端（如新邮箱平台） | 新建 `<provider>.py`，并在 `mail_provider.py` 中接入 |

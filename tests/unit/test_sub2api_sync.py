@@ -609,6 +609,33 @@ def test_collect_managed_targets_free_reads_free_accounts_json(monkeypatch, tmp_
     assert list(targets.keys()) == ["free@example.com"]
 
 
+def test_collect_managed_targets_plus_reads_plus_accounts_json(monkeypatch, tmp_path):
+    """source=plus 走 plus_accounts.load_plus() + PLUS_STATUS_ACTIVE 过滤。"""
+    from autoteam import plus_accounts
+
+    auth_path = tmp_path / "codex-plus@example.com-plus-1.json"
+    auth_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(
+        plus_accounts,
+        "load_plus",
+        lambda: [
+            {"email": "plus@example.com", "status": "active", "auth_file": str(auth_path)},
+            {"email": "failed@example.com", "status": "auth_failed", "auth_file": None},
+            {"email": "mismatch@example.com", "status": "plan_mismatch", "auth_file": str(auth_path)},
+        ],
+    )
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_load_auth_data",
+        lambda path: {"email": "plus@example.com", "access_token": "at"},
+    )
+
+    targets = sub2api_sync._collect_managed_targets("plus")
+
+    assert list(targets.keys()) == ["plus@example.com"]
+
+
 def test_collect_managed_targets_pool_does_not_read_free_accounts(monkeypatch):
     """D2 隔离铁律:pool 同步源不应读 free_accounts.json。"""
     monkeypatch.setattr("autoteam.accounts.load_accounts", lambda: [])
@@ -632,7 +659,7 @@ def test_collect_managed_targets_rejects_unknown_source():
 
 
 def test_collect_all_managed_emails_unions_pool_and_free(monkeypatch):
-    """两边同时贡献邮箱;集合用于删除分支判定"应保留"。"""
+    """三边同时贡献邮箱;集合用于删除分支判定"应保留"。"""
     monkeypatch.setattr(
         "autoteam.accounts.load_accounts",
         lambda: [{"email": "Pool@Example.com"}, {"email": ""}, {"email": "shared@example.com"}],
@@ -641,11 +668,15 @@ def test_collect_all_managed_emails_unions_pool_and_free(monkeypatch):
         "autoteam.free_accounts.load_free",
         lambda: [{"email": "free@example.com"}, {"email": "SHARED@example.com"}],
     )
+    monkeypatch.setattr(
+        "autoteam.plus_accounts.load_plus",
+        lambda: [{"email": "plus@example.com"}, {"email": "shared@example.com"}],
+    )
 
     emails = sub2api_sync._collect_all_managed_emails()
 
-    # 全部 lower-case + 非空;active 池和 FREE 池都贡献了元素;共享邮箱去重
-    assert emails == {"pool@example.com", "free@example.com", "shared@example.com"}
+    # 全部 lower-case + 非空;三池都贡献了元素;共享邮箱去重
+    assert emails == {"pool@example.com", "free@example.com", "plus@example.com", "shared@example.com"}
 
 
 def test_collect_all_managed_emails_continues_when_one_side_raises(monkeypatch):
@@ -659,6 +690,7 @@ def test_collect_all_managed_emails_continues_when_one_side_raises(monkeypatch):
         "autoteam.free_accounts.load_free",
         lambda: [{"email": "free@example.com"}],
     )
+    monkeypatch.setattr("autoteam.plus_accounts.load_plus", lambda: [])
 
     emails = sub2api_sync._collect_all_managed_emails()
 
@@ -723,6 +755,50 @@ def test_sync_to_sub2api_pool_does_not_delete_remote_account_owned_by_free_pool(
     assert result["deleted"] == 0
 
 
+def test_sync_to_sub2api_pool_does_not_delete_remote_account_owned_by_plus_pool(monkeypatch):
+    """active 同步时,Plus 池 active 邮箱应保护 kind=pool 删除分支不误删。"""
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([], []))
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+    monkeypatch.setattr(
+        "autoteam.accounts.load_accounts",
+        lambda: [{"email": "plus@example.com", "status": "standby", "auth_file": ""}],
+    )
+    monkeypatch.setattr("autoteam.free_accounts.load_free", lambda: [])
+    monkeypatch.setattr(
+        "autoteam.plus_accounts.load_plus",
+        lambda: [{"email": "plus@example.com", "status": "active", "auth_file": ""}],
+    )
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_dedupe_managed_accounts",
+        lambda token, items, *, kind: (
+            {
+                "plus@example.com": {
+                    "id": 101,
+                    "status": "active",
+                    "credentials": {"email": "plus@example.com"},
+                    "extra": {},
+                    "group_ids": [],
+                }
+            },
+            0,
+        ),
+    )
+
+    deleted = []
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_delete_account",
+        lambda token, account, **kwargs: deleted.append((account.get("id"), kwargs.get("label"))),
+    )
+
+    result = sub2api_sync.sync_to_sub2api()
+
+    assert deleted == []
+    assert result["deleted"] == 0
+
+
 def test_sync_to_sub2api_pool_still_deletes_orphan_remote_account(monkeypatch, tmp_path):
     """active 同步删除分支保留:远端孤儿账号(两边本地都没有)仍要删——这是原行为的核心。
 
@@ -740,6 +816,7 @@ def test_sync_to_sub2api_pool_still_deletes_orphan_remote_account(monkeypatch, t
         lambda: [{"email": "orphan@example.com", "status": "standby", "auth_file": ""}],
     )
     monkeypatch.setattr("autoteam.free_accounts.load_free", lambda: [])
+    monkeypatch.setattr("autoteam.plus_accounts.load_plus", lambda: [])
     monkeypatch.setattr(
         sub2api_sync,
         "_dedupe_managed_accounts",
@@ -822,6 +899,56 @@ def test_sync_free_to_sub2api_creates_account_from_free_pool(monkeypatch, tmp_pa
     assert captured["extra"]["autoteam_email"] == "free@example.com"
 
 
+def test_sync_plus_to_sub2api_creates_account_from_plus_pool(monkeypatch, tmp_path):
+    """Plus 入口:从 plus_accounts.json 读 active 状态条目并用 kind=plus 创建远端。"""
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(sub2api_sync, "_resolve_group_binding", lambda token: ([7], ["Team Pool"]))
+    monkeypatch.setattr(sub2api_sync, "_resolve_proxy_id", lambda token: None)
+    monkeypatch.setattr(sub2api_sync, "_list_openai_oauth_accounts", lambda token: [])
+    monkeypatch.setattr(sub2api_sync, "_dedupe_managed_accounts", lambda token, items, *, kind: ({}, 0))
+
+    auth_path = tmp_path / "codex-plus@example.com-plus-1.json"
+    auth_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr("autoteam.accounts.load_accounts", lambda: [])
+    monkeypatch.setattr("autoteam.free_accounts.load_free", lambda: [])
+    monkeypatch.setattr(
+        "autoteam.plus_accounts.load_plus",
+        lambda: [
+            {
+                "email": "plus@example.com",
+                "status": "active",
+                "auth_file": str(auth_path),
+                "last_quota": {"primary_pct": 5, "weekly_pct": 8},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_load_auth_data",
+        lambda path: {
+            "email": "plus@example.com",
+            "access_token": "at-1",
+            "refresh_token": "rt-1",
+        },
+    )
+
+    captured = {}
+
+    def fake_create_account(token, **kwargs):
+        captured.update(kwargs)
+        return {"id": 99}
+
+    monkeypatch.setattr(sub2api_sync, "_create_account", fake_create_account)
+
+    result = sub2api_sync.sync_plus_to_sub2api()
+
+    assert result["created"] == 1
+    assert captured["group_ids"] == [7]
+    assert captured["extra"]["autoteam_kind"] == "plus"
+    assert captured["extra"]["autoteam_email"] == "plus@example.com"
+
+
 def test_sync_free_to_sub2api_does_not_delete_active_pool_remote_account(monkeypatch, tmp_path):
     """FREE 同步反向不误删:远端属于 active 池的账号,FREE 同步时应保留。
 
@@ -839,6 +966,7 @@ def test_sync_free_to_sub2api_does_not_delete_active_pool_remote_account(monkeyp
         lambda: [{"email": "active@example.com", "status": "active", "auth_file": ""}],
     )
     monkeypatch.setattr("autoteam.free_accounts.load_free", lambda: [])
+    monkeypatch.setattr("autoteam.plus_accounts.load_plus", lambda: [])
     monkeypatch.setattr(
         sub2api_sync,
         "_dedupe_managed_accounts",
@@ -885,6 +1013,7 @@ def test_sync_free_to_sub2api_deletes_remote_when_pool_email_no_longer_active(mo
         lambda: [{"email": "orphan@example.com", "status": "standby", "auth_file": ""}],
     )
     monkeypatch.setattr("autoteam.free_accounts.load_free", lambda: [])
+    monkeypatch.setattr("autoteam.plus_accounts.load_plus", lambda: [])
     monkeypatch.setattr(
         sub2api_sync,
         "_dedupe_managed_accounts",
@@ -942,6 +1071,41 @@ def test_sync_free_to_sub2api_skips_auth_failed_records(monkeypatch, tmp_path):
     # 半成品被跳过 → 没有任何创建动作
     assert create_calls["n"] == 0
     assert result["created"] == 0
+
+
+def test_delete_plus_account_from_sub2api_only_deletes_plus_kind(monkeypatch):
+    """Plus 删除入口只命中 autoteam_kind=plus，避免误删 active/FREE 的 pool 远端。"""
+    monkeypatch.setattr(sub2api_sync, "_login", lambda: "token")
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_list_openai_oauth_accounts",
+        lambda token: [
+            {
+                "id": 1,
+                "name": "pool@example.com",
+                "credentials": {"email": "plus@example.com"},
+                "extra": {"autoteam_source": "autoteam", "autoteam_kind": "pool"},
+            },
+            {
+                "id": 2,
+                "name": "plus@example.com",
+                "credentials": {"email": "plus@example.com"},
+                "extra": {"autoteam_source": "autoteam", "autoteam_kind": "plus"},
+            },
+        ],
+    )
+
+    deleted = []
+    monkeypatch.setattr(
+        sub2api_sync,
+        "_delete_account",
+        lambda token, account, **kwargs: deleted.append(account["id"]),
+    )
+
+    result = sub2api_sync.delete_plus_account_from_sub2api("PLUS@example.com")
+
+    assert deleted == [2]
+    assert result["deleted"] == ["plus@example.com"]
 
 
 # ---------------------------------------------------------------------------

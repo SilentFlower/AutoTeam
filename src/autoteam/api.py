@@ -2895,6 +2895,26 @@ class FreeCheckQuotaParams(BaseModel):
     emails: list[str] | None = None
 
 
+class PlusImportParams(BaseModel):
+    """``POST /api/plus/import`` 入参。
+
+    :param email: 用户已有 Plus 账号邮箱。
+    :param password: 用户已有 Plus 账号密码。
+    """
+
+    email: str
+    password: str
+
+
+class PlusCheckQuotaParams(BaseModel):
+    """``POST /api/plus/check_quota`` 入参。
+
+    :param emails: ``None`` 表示刷新全部 active/exhausted Plus 号；非空时仅刷新指定邮箱。
+    """
+
+    emails: list[str] | None = None
+
+
 def _sanitize_free_record(rec: dict) -> dict:
     """返回前端可见的免费号 dict。
 
@@ -2906,6 +2926,19 @@ def _sanitize_free_record(rec: dict) -> dict:
     """
     # 明文返回所有字段;此处保留 dict.copy 是为了避免前端直接持有 free_accounts.json
     # 引用,导致后续 update_free 写盘后前端误以为是新数据。
+    return dict(rec)
+
+
+def _sanitize_plus_record(rec: dict) -> dict:
+    """返回前端可见的 Plus 号 dict。
+
+    PRD ``04-30-plus-account-pool-oauth`` 要求 Plus 账号来源是用户导入的已有
+    邮箱 / 密码，因此页面需要允许操作者复制账号密码。响应会返回明文
+    ``password``；调用方已经过 API Key 鉴权，前端不要把 password 写日志或截图。
+
+    :param rec: Plus 池原始记录。
+    :return: 可序列化给前端的 dict 副本。
+    """
     return dict(rec)
 
 
@@ -3048,6 +3081,156 @@ def delete_free_email(email: str, admin_id: str | None = Depends(get_current_adm
         cleanup = _admin_state_call(delete_free_account, admin_id, email, cleanup_remote=True)
         return {
             "message": "免费号删除完成",
+            "deleted_email": email,
+            "cleanup": cleanup,
+        }
+    finally:
+        _playwright_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Plus 号池端点(PRD 04-30-plus-account-pool-oauth)
+# ---------------------------------------------------------------------------
+#
+# Plus 池只接收用户导入的已有 Plus 邮箱 / 密码；不做自动注册、购买或 Team
+# invite/remove。OAuth 登录复用 codex_auth 现有流程，手机号验证由 HeroSMS 自动接码。
+# 存储使用 ``plus_accounts.json``，与 active 池 / FREE 池完全隔离。
+
+
+@app.post("/api/plus/import", status_code=202)
+def post_plus_import(params: PlusImportParams, admin_id: str | None = Depends(get_current_admin_id)):
+    """导入已有 Plus 账号并异步执行 Codex OAuth。
+
+    :param params: 邮箱 / 密码请求体。
+    :param admin_id: 当前请求目标 admin。
+    :return: 后台任务对象。
+    """
+    email = params.email.strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Plus 号邮箱不能为空")
+    if not params.password:
+        raise HTTPException(status_code=400, detail="Plus 号密码不能为空")
+
+    _require_mail_provider_configs("导入 Plus 号")
+    _require_sync_target_configs("导入 Plus 号")
+
+    from autoteam.plus_accounts import import_plus_account
+
+    task = _start_task(
+        "plus_import",
+        import_plus_account,
+        {"email": email},
+        email,
+        params.password,
+        admin_id=admin_id,
+    )
+    return task
+
+
+@app.get("/api/plus/list")
+def get_plus_list(admin_id: str | None = Depends(get_current_admin_id)):
+    """返回当前 admin 的 Plus 池全部记录。
+
+    响应包含明文 ``password``，用于操作者复制已有 Plus 账号凭据；详见
+    :func:`_sanitize_plus_record` 注释。
+
+    :param admin_id: 当前请求目标 admin。
+    :return: Plus 号记录列表。
+    """
+    from autoteam.plus_accounts import load_plus
+
+    records = _admin_state_call(load_plus, admin_id)
+    return [_sanitize_plus_record(r) for r in records]
+
+
+@app.post("/api/plus/check_quota", status_code=202)
+def post_plus_check_quota(params: PlusCheckQuotaParams, admin_id: str | None = Depends(get_current_admin_id)):
+    """异步刷新 Plus 号额度。
+
+    :param params: 可选邮箱列表。
+    :return: 后台任务对象。
+    """
+    from autoteam.plus_accounts import check_plus_quota
+
+    task = _start_task(
+        "plus_check_quota",
+        check_plus_quota,
+        {"emails": params.emails},
+        params.emails,
+        admin_id=admin_id,
+    )
+    return task
+
+
+@app.post("/api/plus/sync_sub2api")
+def post_plus_sync_sub2api(admin_id: str | None = Depends(get_current_admin_id)):
+    """同步执行 Plus 池 → sub2api。
+
+    :return: 成功消息。
+    """
+    _require_sync_target_configs("同步 Plus 号到 sub2api")
+
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再试"))
+
+    try:
+        from autoteam.sub2api_sync import sync_plus_to_sub2api
+
+        sync_plus_to_sub2api(admin_id=admin_id)
+        return {"message": "Plus 池已同步到 sub2api"}
+    except Exception as exc:
+        logger.error("[Plus池] sub2api 同步失败: %s", exc)
+        raise HTTPException(status_code=500, detail=f"同步失败: {exc}") from exc
+    finally:
+        _playwright_lock.release()
+
+
+@app.post("/api/plus/{email}/reauth", status_code=202)
+def post_plus_reauth(email: str, admin_id: str | None = Depends(get_current_admin_id)):
+    """对单条 Plus 号触发 Codex OAuth 重新授权。
+
+    :param email: 目标 Plus 号邮箱。
+    :param admin_id: 当前请求目标 admin。
+    :return: 后台任务对象。
+    """
+    _require_mail_provider_configs(f"重新授权 Plus 号 {email}")
+    _require_sync_target_configs(f"重新授权 Plus 号 {email}")
+
+    from autoteam.plus_accounts import reauth_plus_account
+
+    task = _start_task(
+        "plus_reauth",
+        reauth_plus_account,
+        {"email": email},
+        email,
+        admin_id=admin_id,
+    )
+    return task
+
+
+@app.delete("/api/plus/{email}")
+def delete_plus_email(email: str, admin_id: str | None = Depends(get_current_admin_id)):
+    """删除 Plus 号(本地 auth_file + sub2api 远端 + JSON 条目)。
+
+    Plus 账号来自用户导入，不删除邮箱本身。
+
+    :param email: 目标 Plus 号邮箱。
+    :param admin_id: 当前请求目标 admin。
+    :return: cleanup 摘要。
+    """
+    if not _playwright_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail=_current_busy_detail("有任务正在执行，请等待完成后再删除 Plus 号"))
+
+    try:
+        from autoteam.plus_accounts import delete_plus_account, find_plus, load_plus
+
+        records = _admin_state_call(load_plus, admin_id)
+        if find_plus(records, email) is None:
+            raise HTTPException(status_code=404, detail="Plus 号不存在")
+
+        cleanup = _admin_state_call(delete_plus_account, admin_id, email, cleanup_remote=True)
+        return {
+            "message": "Plus 号删除完成",
             "deleted_email": email,
             "cleanup": cleanup,
         }
