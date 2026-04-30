@@ -24,6 +24,9 @@
 # Update backup directories
 .backup-*
 
+# Skill-garden install.sh 写出的 workflow.md 备份
+*.bak
+
 # Conflict resolution temp files
 *.new
 

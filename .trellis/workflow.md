@@ -545,6 +545,15 @@ After the above, remind the user they can run `/finish-work` to wrap up (archive
      a status has no tag block. -->
 
 [workflow-state:no_task]
+<!-- BEGIN skill-garden workflow-state no-task-gate v0.5 -->
+CRITICAL POST-TASK HANDOFF:
+If you create or resume a Trellis task in this turn, task creation is not permission to implement inline.
+After the PRD/context is ready and the task is started, the next implementation action is Phase 2.1 and must go through `trellis-route(implement)`.
+If the task is still planning, continue requirements/context work only; do not write implementation code.
+Only skip Trellis when the current user message explicitly opts out with phrases like "skip trellis", "no task", "just do it", "直接改", or "先别建任务".
+Do not infer opt-out from urgency, small scope, or missing details.
+<!-- END skill-garden workflow-state no-task-gate v0.5 -->
+
 No active task.
 Trigger words in the user message that suggest creating a task: 重构 / 抽成 / 独立 / 分发 / 拆出来 / 搞一个 / 做成 / 接入 / 集成 / refactor / rewrite / extract / productize / publish / build X / design Y.
 Task is NOT required if ALL three hold: (a) zero file writes this turn, (b) answer fits in one reply with no multi-round plan, (c) no research beyond reading 1-2 repo files.
@@ -554,11 +563,26 @@ User override (per-turn escape hatch): if the user's CURRENT message contains an
 [/workflow-state:no_task]
 
 [workflow-state:planning]
+<!-- BEGIN skill-garden workflow-state planning-handoff v0.5 -->
+CRITICAL PLANNING HANDOFF:
+Planning is not implementation permission.
+Complete or update `prd.md` and required context first.
+After the task moves to `in_progress`, the next action is `trellis-route(implement)`, not editing files directly.
+<!-- END skill-garden workflow-state planning-handoff v0.5 -->
+
 Complete prd.md via trellis-brainstorm skill; then run task.py start.
 Research belongs in `{task_dir}/research/*.md`, written by `trellis-research` sub-agents. Do NOT inline WebFetch/WebSearch in main session — PRD only links to research files.
 [/workflow-state:planning]
 
 [workflow-state:in_progress]
+<!-- BEGIN skill-garden workflow-state trellis-route v0.5 -->
+CRITICAL ROUTING OVERRIDE:
+If the next action is implementation, quality check, or final quality verification, invoke `trellis-route` first.
+Required flow:
+`trellis-route(implement)` → run the selected implementation path → `trellis-route(check)` → run the selected check path → `trellis-update-spec` → finish.
+This rule overrides any older wording below that directly calls `trellis-implement` / `trellis-check`.
+<!-- END skill-garden workflow-state trellis-route v0.5 -->
+
 Flow: trellis-implement → trellis-check → trellis-update-spec → finish
 Next required action: inspect conversation history + git status, then execute the next uncompleted step in that sequence.
 For agent-capable platforms, the default is to dispatch `trellis-implement` for implementation and `trellis-check` before reporting completion — do not edit code in the main session by default.
