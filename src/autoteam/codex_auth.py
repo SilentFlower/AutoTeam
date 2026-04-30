@@ -1136,6 +1136,18 @@ def login_codex_via_browser(
                     time.sleep(5)
                     _screenshot(page, f"codex_04_consent_{step + 1}.png")
                 else:
+                    # consent 按钮没命中时,再试一次"错误页 Try again"按钮:
+                    # OpenAI consent 流程偶发跳到错误页(带 Try again),如果直接 break
+                    # 整个 OAuth 会拉不到 callback 失败。命中即点击 + continue,让下一轮
+                    # 重新找 Continue/Allow;共享 for step in range(10) 的 10 步上限,
+                    # 避免错误页死循环。
+                    try_again_btn = page.locator('button:has-text("Try again"), button:has-text("重试")').first
+                    if try_again_btn.is_visible(timeout=2000):
+                        logger.info("[Codex] consent 出现错误页,点击 Try again 续跑 (step %d)...", step + 1)
+                        _screenshot(page, f"codex_04_consent_error_{step + 1}.png")
+                        try_again_btn.click()
+                        time.sleep(5)
+                        continue
                     break
             except Exception:
                 break
@@ -1450,6 +1462,19 @@ class SessionCodexAuthFlow:
             if consent_btn.is_visible(timeout=1000):
                 consent_btn.click()
                 logger.info("[Codex] 主号点击继续/授权")
+                time.sleep(3)
+                acted = True
+        except Exception:
+            pass
+
+        # 错误页 Try again 兜底:consent 后偶发跳到带 Try again 的错误页,
+        # 命中即点击,acted=True 让 _advance 外层 continue 进入下一轮 step,
+        # 由原有 attempts 上限兜底避免死循环。
+        try:
+            try_again_btn = self.page.locator('button:has-text("Try again"), button:has-text("重试")').first
+            if try_again_btn.is_visible(timeout=1000):
+                try_again_btn.click()
+                logger.info("[Codex] 主号 consent 出现错误页,点击 Try again 续跑")
                 time.sleep(3)
                 acted = True
         except Exception:

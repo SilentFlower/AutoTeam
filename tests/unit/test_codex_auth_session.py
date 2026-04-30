@@ -176,3 +176,116 @@ def test_team_workspace_selection_requires_exact_workspace_name():
 
     assert codex_auth._workspace_label_candidates(page) == [("Personal account", items[1])]
     assert codex_auth._select_team_workspace(page, "Idapro") is False
+
+
+# ---------------------------------------------------------------------------
+# 以下测试覆盖 SessionCodexAuthFlow._click_workspace_or_consent 的"Try again 兜底"
+# 分支(2026-04-29 新增)。改动详见 .trellis/tasks/04-29-codex-auth-try-again/prd.md。
+# ---------------------------------------------------------------------------
+
+
+class _FakeButton:
+    """模拟 Playwright button locator(不带 .first 包装),用于 _click_workspace_or_consent。"""
+
+    def __init__(self, *, visible=True, raise_on_visible=False):
+        self._visible = visible
+        self._raise_on_visible = raise_on_visible
+        self.clicked = False
+
+    def is_visible(self, timeout=0):
+        if self._raise_on_visible:
+            raise RuntimeError("locator boom")
+        return self._visible
+
+    def click(self, timeout=0, force=False):
+        self.clicked = True
+
+
+class _FakeFirst:
+    """模拟 Playwright locator 的 .first 属性,持有同一个底层 button。"""
+
+    def __init__(self, button):
+        self.first = button
+
+
+class _FakeAuthPage:
+    """按 selector 路由到 consent / try-again 两类 button 的最小 page。"""
+
+    def __init__(self, *, consent_button=None, try_again_button=None):
+        # 默认两个按钮都不可见(用于"all miss"场景)
+        self._consent = consent_button or _FakeButton(visible=False)
+        self._try_again = try_again_button or _FakeButton(visible=False)
+
+    def locator(self, selector):
+        # selector 文本里若含 Try again / 重试 视作错误页按钮选择器
+        if "Try again" in selector or "重试" in selector:
+            return _FakeFirst(self._try_again)
+        return _FakeFirst(self._consent)
+
+
+def _build_session_flow(page, *, workspace_name=""):
+    """绕过 SessionCodexAuthFlow.__init__(它会做 PKCE / build_auth_url),只塞入测试需要的属性。"""
+    flow = codex_auth.SessionCodexAuthFlow.__new__(codex_auth.SessionCodexAuthFlow)
+    flow.page = page
+    flow.workspace_name = workspace_name
+    return flow
+
+
+def test_click_workspace_or_consent_workspace_branch_takes_precedence(monkeypatch):
+    # workspace 命中时,函数立即在第一个 try 块里 acted=True;
+    # 但它**不会**短路 consent / try-again 分支,只是后两者也不命中,所以最终 acted 仍 True
+    consent = _FakeButton(visible=False)
+    try_again = _FakeButton(visible=False)
+    page = _FakeAuthPage(consent_button=consent, try_again_button=try_again)
+    flow = _build_session_flow(page, workspace_name="Idapro")
+    monkeypatch.setattr(codex_auth, "_is_workspace_selection_page", lambda p: True)
+    monkeypatch.setattr(codex_auth, "_select_team_workspace", lambda p, name: True)
+    monkeypatch.setattr(codex_auth.time, "sleep", lambda s: None)
+
+    assert flow._click_workspace_or_consent() is True
+    assert consent.clicked is False
+    assert try_again.clicked is False
+
+
+def test_click_workspace_or_consent_consent_clicked(monkeypatch):
+    consent = _FakeButton(visible=True)
+    try_again = _FakeButton(visible=False)
+    page = _FakeAuthPage(consent_button=consent, try_again_button=try_again)
+    flow = _build_session_flow(page, workspace_name="")
+    monkeypatch.setattr(codex_auth.time, "sleep", lambda s: None)
+
+    assert flow._click_workspace_or_consent() is True
+    assert consent.clicked is True
+    assert try_again.clicked is False
+
+
+def test_click_workspace_or_consent_try_again_clicked_when_consent_missing(monkeypatch):
+    consent = _FakeButton(visible=False)
+    try_again = _FakeButton(visible=True)
+    page = _FakeAuthPage(consent_button=consent, try_again_button=try_again)
+    flow = _build_session_flow(page, workspace_name="")
+    monkeypatch.setattr(codex_auth.time, "sleep", lambda s: None)
+
+    assert flow._click_workspace_or_consent() is True
+    assert consent.clicked is False
+    assert try_again.clicked is True
+
+
+def test_click_workspace_or_consent_all_miss_returns_false(monkeypatch):
+    page = _FakeAuthPage()  # 默认两个按钮都不可见
+    flow = _build_session_flow(page, workspace_name="")
+    monkeypatch.setattr(codex_auth.time, "sleep", lambda s: None)
+
+    assert flow._click_workspace_or_consent() is False
+
+
+def test_click_workspace_or_consent_try_again_locator_exception_swallowed(monkeypatch):
+    # try-again locator 的 is_visible 抛异常时,被新增 try 块的 except Exception: pass
+    # 吞掉,函数仍正常返回 False(不冒泡破坏外层 _advance 循环)
+    try_again = _FakeButton(raise_on_visible=True)
+    page = _FakeAuthPage(try_again_button=try_again)
+    flow = _build_session_flow(page, workspace_name="")
+    monkeypatch.setattr(codex_auth.time, "sleep", lambda s: None)
+
+    assert flow._click_workspace_or_consent() is False
+    assert try_again.clicked is False
