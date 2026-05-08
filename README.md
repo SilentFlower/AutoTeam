@@ -31,6 +31,7 @@
 | 🔍 | 自动巡检 | 自动检查额度并触发轮转 |
 | ☁️ | 远端同步 | 同步认证到 **CLIProxyAPI / Sub2API** |
 | 🔐 | OAuth 导入 | 支持手动接管 OAuth 流程导入账号 |
+| 🤖 | Plus 号自动注册 | 一键批量注册 ChatGPT Plus(印尼区 GoPay 1 个月免费试用 + Codex OAuth + sub2api 同步),WhatsApp OTP 在 Web UI 中喂入,需在 `.env` 配置 `GOPAY_*` 三件套 |
 
 ## 支持的外部组件
 

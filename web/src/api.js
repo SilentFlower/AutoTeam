@@ -201,5 +201,14 @@ export const api = {
     syncSub2api: () => request('POST', '/plus/sync_sub2api'),
     reauth: (email) => request('POST', `/plus/${encodeURIComponent(email)}/reauth`),
     delete: (email) => request('DELETE', `/plus/${encodeURIComponent(email)}`),
+    // Plus 号自动注册(注册→GoPay→OAuth→sub2api 全链路);PRD 05-08-plus-oauth-sub2api。
+    // submit 返回 {job_id};随后轮询 status 获取 step / errors / summary,
+    // 看到 step=awaiting_whatsapp_otp 时弹输入框,提交 OTP 走 feedOtp。
+    autoRegister: (count = 1) => request('POST', '/plus/auto_register', { count }),
+    autoRegisterStatus: (jobId) => request('GET', `/plus/auto_register/${encodeURIComponent(jobId)}`),
+    autoRegisterFeedOtp: (jobId, otp) =>
+      request('POST', `/plus/auto_register/${encodeURIComponent(jobId)}/feed_otp`, { otp }),
+    autoRegisterCancel: (jobId) =>
+      request('POST', `/plus/auto_register/${encodeURIComponent(jobId)}/cancel`),
   },
 }

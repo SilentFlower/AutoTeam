@@ -13,15 +13,24 @@
           <button
             type="button"
             @click="openImport"
-            :disabled="!!runningTask"
+            :disabled="!!runningTask || !!autoRegisterJob"
             class="btn-primary justify-center rounded-2xl px-4 py-2 text-sm"
           >
             ➕ 导入 Plus 号
           </button>
           <button
             type="button"
+            @click="openAutoRegister"
+            :disabled="!!runningTask || !!autoRegisterJob"
+            class="btn-primary justify-center rounded-2xl px-4 py-2 text-sm"
+            title="批量自动注册 Plus 号:注册 → GoPay → OAuth → sub2api"
+          >
+            🤖 自动注册 Plus 号
+          </button>
+          <button
+            type="button"
             @click="refreshAllQuota"
-            :disabled="!!runningTask || refreshing"
+            :disabled="!!runningTask || !!autoRegisterJob || refreshing"
             class="btn-secondary justify-center rounded-2xl px-3 py-2 text-sm"
           >
             {{ refreshing ? '提交中...' : '🔄 全量刷新额度' }}
@@ -29,7 +38,7 @@
           <button
             type="button"
             @click="syncSub2api"
-            :disabled="!!runningTask || syncing"
+            :disabled="!!runningTask || !!autoRegisterJob || syncing"
             class="btn-secondary justify-center rounded-2xl px-3 py-2 text-sm"
           >
             {{ syncing ? '同步中...' : '🔁 同步到 sub2api' }}
@@ -41,6 +50,71 @@
             class="btn-secondary justify-center rounded-2xl px-3 py-2 text-sm"
           >
             {{ loading ? '加载中...' : '📋 刷新列表' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 自动注册进度面板:job 存在时常驻顶部直至终态 -->
+    <div
+      v-if="autoRegisterJob"
+      class="glass-card p-5 border border-purple-500/30 bg-purple-500/5"
+    >
+      <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 mb-2">
+            <span class="text-sm font-semibold text-purple-300">🤖 自动注册任务</span>
+            <span class="text-xs text-slate-400 font-mono">{{ autoRegisterJob.job_id }}</span>
+            <span
+              class="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium"
+              :class="jobStatusBadge(autoRegisterJob.status)"
+            >
+              {{ jobStatusLabel(autoRegisterJob.status) }}
+            </span>
+          </div>
+          <div class="text-sm text-slate-300">
+            <span class="font-medium">{{ stepLabel(autoRegisterJob.step) }}</span>
+            <span class="ml-2 text-xs text-slate-500">
+              第 {{ Math.min((autoRegisterJob.current_index || 0) + 1, autoRegisterJob.total) }}/{{ autoRegisterJob.total }} 个
+            </span>
+          </div>
+          <div class="mt-2 h-2 w-full overflow-hidden rounded-full bg-slate-800">
+            <div
+              class="h-full bg-purple-400 transition-all"
+              :style="{ width: jobProgressPct + '%' }"
+            ></div>
+          </div>
+          <div class="mt-2 flex flex-wrap gap-3 text-xs text-slate-400">
+            <span>✅ 成功 <span class="text-green-400 font-mono">{{ autoRegisterJob.ok || 0 }}</span></span>
+            <span v-if="autoRegisterSummary?.payment_failed">付款失败 <span class="text-red-400 font-mono">{{ autoRegisterSummary.payment_failed }}</span></span>
+            <span v-if="autoRegisterSummary?.auth_failed">OAuth 失败 <span class="text-amber-400 font-mono">{{ autoRegisterSummary.auth_failed }}</span></span>
+            <span v-if="autoRegisterSummary?.cancelled">已取消 <span class="text-gray-400 font-mono">{{ autoRegisterSummary.cancelled }}</span></span>
+            <span v-if="autoRegisterSummary?.other_failed">其他失败 <span class="text-red-400 font-mono">{{ autoRegisterSummary.other_failed }}</span></span>
+          </div>
+          <div v-if="autoRegisterJob.errors?.length" class="mt-2 text-xs text-red-300">
+            最近失败: {{ autoRegisterJob.errors[autoRegisterJob.errors.length - 1].error_type }}
+            <span v-if="autoRegisterJob.errors[autoRegisterJob.errors.length - 1].error_detail" class="text-slate-400">
+              ({{ autoRegisterJob.errors[autoRegisterJob.errors.length - 1].error_detail }})
+            </span>
+          </div>
+        </div>
+        <div class="flex items-center gap-2 shrink-0">
+          <button
+            v-if="!isJobTerminal(autoRegisterJob.status)"
+            type="button"
+            @click="cancelAutoRegister"
+            :disabled="cancelling"
+            class="btn-secondary justify-center rounded-2xl px-3 py-2 text-sm"
+          >
+            {{ cancelling ? '取消中...' : '✕ 取消任务' }}
+          </button>
+          <button
+            v-if="isJobTerminal(autoRegisterJob.status)"
+            type="button"
+            @click="dismissAutoRegister"
+            class="btn-secondary justify-center rounded-2xl px-3 py-2 text-sm"
+          >
+            收起
           </button>
         </div>
       </div>
@@ -178,6 +252,106 @@
         </div>
       </div>
     </div>
+
+    <!-- 自动注册启动模态 -->
+    <div
+      v-if="showAutoRegisterModal"
+      class="fixed inset-0 z-40 flex items-center justify-center bg-slate-950/70 p-4 backdrop-blur"
+      @click.self="closeAutoRegister"
+    >
+      <div class="glass-card w-full max-w-md p-6">
+        <div class="mb-4 flex items-center justify-between">
+          <h3 class="text-lg font-semibold text-white">🤖 自动注册 Plus 号</h3>
+          <button type="button" @click="closeAutoRegister" class="text-slate-400 hover:text-white text-sm">
+            ✕ 关闭
+          </button>
+        </div>
+        <div class="space-y-4">
+          <div class="text-xs text-slate-400 leading-5">
+            后端将依次执行:创建临时邮箱 → ChatGPT 注册 → GoPay 印尼区 1 个月免费试用付款
+            (含 WhatsApp OTP,届时弹框喂入) → 设密码 → 取消续订 → Codex OAuth → 同步 sub2api。
+            单 GoPay 账号需串行,每号约 ~9 分钟。
+          </div>
+          <div>
+            <label class="mb-2 block text-sm text-slate-300">数量</label>
+            <input
+              v-model.number="autoRegisterCount"
+              type="number"
+              min="1"
+              max="20"
+              class="input-dark"
+              @keyup.enter="submitAutoRegister"
+            />
+            <p class="mt-1 text-xs text-slate-500">默认 1;批量时单条失败不影响其他号入池。</p>
+          </div>
+        </div>
+        <div class="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            @click="closeAutoRegister"
+            class="btn-secondary justify-center rounded-2xl px-4 py-2 text-sm"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            @click="submitAutoRegister"
+            :disabled="!validAutoRegisterCount"
+            class="btn-primary justify-center rounded-2xl px-4 py-2 text-sm"
+          >
+            开始注册
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- WhatsApp OTP 输入弹框:轮询发现 step=awaiting_whatsapp_otp 时自动弹出 -->
+    <div
+      v-if="showOtpModal"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur"
+    >
+      <div class="glass-card w-full max-w-md p-6 border border-amber-500/30">
+        <div class="mb-4 flex items-center justify-between">
+          <h3 class="text-lg font-semibold text-amber-300">📱 等待 GoPay WhatsApp OTP</h3>
+        </div>
+        <div class="space-y-4">
+          <div class="text-sm text-slate-300 leading-6">
+            后端正在等 GoPay 通过 WhatsApp 发出的 OTP 验证码。请去 WhatsApp 找到验证码,
+            <strong class="text-amber-300">5 分钟内</strong>填入下方并提交。
+          </div>
+          <div>
+            <label class="mb-2 block text-sm text-slate-300">OTP 验证码</label>
+            <input
+              v-model.trim="otpInput"
+              type="text"
+              autocomplete="off"
+              inputmode="numeric"
+              class="input-dark font-mono tracking-widest"
+              placeholder="例如 123456"
+              @keyup.enter="submitOtp"
+            />
+          </div>
+        </div>
+        <div class="mt-5 flex justify-end gap-2">
+          <button
+            type="button"
+            @click="cancelAutoRegister"
+            :disabled="cancelling"
+            class="btn-secondary justify-center rounded-2xl px-4 py-2 text-sm"
+          >
+            取消整单
+          </button>
+          <button
+            type="button"
+            @click="submitOtp"
+            :disabled="!otpInput || feedingOtp"
+            class="btn-primary justify-center rounded-2xl px-4 py-2 text-sm"
+          >
+            {{ feedingOtp ? '提交中...' : '提交 OTP' }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -188,7 +362,7 @@
  * Plus 号池管理页面。响应包含明文 password，用于导入账号后的操作者复制，
  * 前端不要写日志或截图。
  */
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api.js'
 
 const props = defineProps({
@@ -207,7 +381,30 @@ const showImportModal = ref(false)
 const importEmail = ref('')
 const importPassword = ref('')
 
+// 自动注册任务状态(PRD 05-08-plus-oauth-sub2api)
+const autoRegisterJob = ref(null)
+const showAutoRegisterModal = ref(false)
+const autoRegisterCount = ref(1)
+const showOtpModal = ref(false)
+const otpInput = ref('')
+const cancelling = ref(false)
+const feedingOtp = ref(false)
+let pollTimer = null
+const POLL_INTERVAL_MS = 2000
+
 const validImport = computed(() => importEmail.value.includes('@') && importPassword.value.length > 0)
+const validAutoRegisterCount = computed(() => {
+  const n = autoRegisterCount.value
+  return Number.isInteger(n) && n >= 1 && n <= 20
+})
+const autoRegisterSummary = computed(() => autoRegisterJob.value?.summary || null)
+const jobProgressPct = computed(() => {
+  const job = autoRegisterJob.value
+  if (!job || !job.total) return 0
+  // 终态显示 100%;否则按"已完成 / 总数"算
+  if (isJobTerminal(job.status)) return 100
+  return Math.min(100, Math.round(((job.current_index || 0) / job.total) * 100))
+})
 
 function showMessage(text, level = 'info') {
   message.value = text
@@ -437,7 +634,198 @@ function relativeTime(ts) {
   return `${Math.floor(diff / 86400)} 天前`
 }
 
+// =======================================================================
+// 自动注册任务(PRD 05-08-plus-oauth-sub2api)
+// =======================================================================
+
+function openAutoRegister() {
+  if (autoRegisterJob.value) return
+  autoRegisterCount.value = 1
+  showAutoRegisterModal.value = true
+}
+
+function closeAutoRegister() {
+  showAutoRegisterModal.value = false
+}
+
+async function submitAutoRegister() {
+  if (!validAutoRegisterCount.value) return
+  const count = autoRegisterCount.value
+  closeAutoRegister()
+  try {
+    const resp = await api.plus.autoRegister(count)
+    autoRegisterJob.value = {
+      job_id: resp.job_id,
+      status: 'pending',
+      step: null,
+      current_index: 0,
+      total: count,
+      ok: 0,
+      errors: [],
+      summary: null,
+    }
+    showMessage(`已提交自动注册任务,job_id=${resp.job_id}`, 'success')
+    startPolling()
+  } catch (e) {
+    showMessage(`提交失败: ${e.message}`, 'error')
+  }
+}
+
+function startPolling() {
+  stopPolling()
+  pollTimer = setInterval(pollAutoRegisterJob, POLL_INTERVAL_MS)
+  // 立即刷一次,缩短"提交→看到 step"的延迟
+  pollAutoRegisterJob()
+}
+
+function stopPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer)
+    pollTimer = null
+  }
+}
+
+async function pollAutoRegisterJob() {
+  const job = autoRegisterJob.value
+  if (!job) {
+    stopPolling()
+    return
+  }
+  try {
+    const fresh = await api.plus.autoRegisterStatus(job.job_id)
+    autoRegisterJob.value = fresh
+
+    // step=awaiting_whatsapp_otp 时弹 OTP 输入框;离开该 step 自动收起
+    if (fresh.step === 'awaiting_whatsapp_otp' && !showOtpModal.value) {
+      otpInput.value = ''
+      showOtpModal.value = true
+    } else if (fresh.step !== 'awaiting_whatsapp_otp' && showOtpModal.value) {
+      showOtpModal.value = false
+    }
+
+    // 终态:停轮询,刷新列表(因新号已落库),OTP 弹框收起
+    if (isJobTerminal(fresh.status)) {
+      stopPolling()
+      showOtpModal.value = false
+      const summary = fresh.summary || {}
+      const okCount = summary.ok || 0
+      if (okCount > 0) {
+        await loadList()
+      }
+      const lvl = fresh.status === 'cancelled' ? 'warn' : okCount > 0 ? 'success' : 'error'
+      showMessage(
+        `自动注册结束: ok=${okCount}, ` +
+          `cancelled=${summary.cancelled || 0}, ` +
+          `payment_failed=${summary.payment_failed || 0}, ` +
+          `auth_failed=${summary.auth_failed || 0}`,
+        lvl,
+      )
+    }
+  } catch (e) {
+    // 404 = job 已被清理(服务重启等),停止轮询
+    if (e.status === 404) {
+      stopPolling()
+      showMessage('自动注册任务状态丢失(可能服务已重启),停止轮询', 'warn')
+      autoRegisterJob.value = null
+      showOtpModal.value = false
+    }
+    // 其他网络错误:静默,等下一轮再试
+  }
+}
+
+async function submitOtp() {
+  const job = autoRegisterJob.value
+  if (!job || !otpInput.value) return
+  feedingOtp.value = true
+  try {
+    await api.plus.autoRegisterFeedOtp(job.job_id, otpInput.value)
+    showOtpModal.value = false
+    otpInput.value = ''
+    showMessage('OTP 已提交,等待后端继续付款流程', 'success')
+    // 立即刷一次状态,加快进入下一步显示
+    pollAutoRegisterJob()
+  } catch (e) {
+    showMessage(`OTP 提交失败: ${e.message}`, 'error')
+  } finally {
+    feedingOtp.value = false
+  }
+}
+
+async function cancelAutoRegister() {
+  const job = autoRegisterJob.value
+  if (!job) return
+  cancelling.value = true
+  try {
+    await api.plus.autoRegisterCancel(job.job_id)
+    showMessage('已请求取消;已付款的号需运营手动处置(GoPay 不退款)', 'warn')
+    // 立即刷一次,通常 1-2 秒内会进入终态
+    pollAutoRegisterJob()
+  } catch (e) {
+    showMessage(`取消失败: ${e.message}`, 'error')
+  } finally {
+    cancelling.value = false
+  }
+}
+
+function dismissAutoRegister() {
+  // 终态后用户主动收起进度面板
+  autoRegisterJob.value = null
+  showOtpModal.value = false
+  stopPolling()
+}
+
+function isJobTerminal(status) {
+  return status === 'done' || status === 'cancelled' || status === 'failed'
+}
+
+function jobStatusLabel(status) {
+  return (
+    {
+      pending: '已提交',
+      running: '运行中',
+      done: '完成',
+      cancelled: '已取消',
+      failed: '失败',
+    }[status] || status
+  )
+}
+
+function jobStatusBadge(status) {
+  return (
+    {
+      pending: 'bg-blue-500/10 text-blue-300',
+      running: 'bg-purple-500/15 text-purple-300',
+      done: 'bg-green-500/15 text-green-400',
+      cancelled: 'bg-gray-500/15 text-gray-300',
+      failed: 'bg-red-500/15 text-red-300',
+    }[status] || 'bg-gray-500/10 text-gray-400'
+  )
+}
+
+function stepLabel(step) {
+  if (!step) return '准备中...'
+  return (
+    {
+      creating_email: '创建临时邮箱',
+      signing_up: '注册 ChatGPT',
+      awaiting_email_otp: '等待邮箱验证码',
+      filling_about_you: '填写注册资料',
+      paying_gopay: 'GoPay 付款中',
+      awaiting_whatsapp_otp: '⏳ 等待 WhatsApp OTP(请在弹框中输入)',
+      setting_password: '设置 ChatGPT 密码',
+      cancelling_subscription: '取消续订',
+      oauth: 'Codex OAuth 登录',
+      syncing_sub2api: '同步到 sub2api',
+      done: '✅ 完成',
+    }[step] || step
+  )
+}
+
 onMounted(() => {
   loadList()
+})
+
+onUnmounted(() => {
+  stopPolling()
 })
 </script>

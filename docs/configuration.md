@@ -18,6 +18,9 @@ cp .env.example .env
 | `CF_TEMP_EMAIL_BASE_URL` | Cloudflare Temp Email 后端 API 根地址 | 使用 Cloudflare Temp Email 时必填 |
 | `CF_TEMP_EMAIL_ADMIN_PASSWORD` | Cloudflare Temp Email 管理员密码 | 使用 Cloudflare Temp Email 时必填 |
 | `CF_TEMP_EMAIL_DOMAIN` | Cloudflare Temp Email 默认邮箱域名 | 使用 Cloudflare Temp Email 时必填 |
+| `GOPAY_PHONE` | GoPay 注册手机号(纯数字,不带 + 与国家码) | 使用「🤖 自动注册 Plus 号」时必填 |
+| `GOPAY_COUNTRY_CODE` | GoPay 手机国家码(纯数字,如 `86` / `62`) | 使用「🤖 自动注册 Plus 号」时必填 |
+| `GOPAY_PIN` | GoPay 6 位支付 PIN | 使用「🤖 自动注册 Plus 号」时必填 |
 | `SYNC_TARGET_CPA` | 是否启用 CPA 同步（`true/false`） | 否 |
 | `CPA_URL` | CPA（CLIProxyAPI）地址 | 启用 CPA 时必填（默认 `http://127.0.0.1:8317`） |
 | `CPA_KEY` | CPA 管理密钥 | 启用 CPA 时必填 |
