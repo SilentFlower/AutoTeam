@@ -102,31 +102,44 @@ python3 ./.trellis/scripts/get_context.py --mode phase --step <X.Y>  # detailed 
 
 ## skill-garden Override: trellis-route routing
 
-> Injected by skill-garden — **PRIORITY: HIGHEST**, wins on conflict with workflow.md upstream.
-> Source: https://github.com/SilentFlower/skill-garden. Remove by deleting BEGIN..END markers.
+> Long-form rules complementing the per-turn breadcrumb. Source: github.com/SilentFlower/skill-garden.
 
-**Scope**: every place workflow.md tells you to dispatch `trellis-implement` / `trellis-check`, or to load the `trellis-check` / `trellis-check-all` skill — that's Phase 2.1 (Implement), Phase 2.2 (Quality check), Phase 3.1 (Quality verification, pre-commit final), Skill Routing main table, and the DO-NOT-skip table.
+**Scope**: Phase 2.1 / 2.2 / 3.1 dispatch decisions, plus the Skill Routing + DO-NOT-skip tables. Per-turn breadcrumb covers the high-level rules; this file holds the specifics that don't fit there.
 
-### Override A — Always route through `trellis-route` first
+### Override A — No pre-invoke chatter
 
-Wherever the upstream tells you to dispatch / load the implement or check target, invoke the `trellis-route` skill **FIRST** with the appropriate `target` and follow whatever next-action it returns. Never call `Agent({subagent_type: 'trellis-implement'|'trellis-check'})` or load `trellis-check`/`trellis-check-all` directly — go through `trellis-route`.
+`trellis-route` returns 4 modes for `target=check` (check-all/check × inline/subagent) and 2 for `target=implement`. Step 1.7's recommendation is generated INSIDE the skill and surfaced via Step 2's `AskUserQuestion` — the **only** prompt point.
 
-`target=check` returns 4 modes (check-all/check × inline/subagent); `target=implement` returns inline or subagent. trellis-route's Step 1.7 makes a per-call context-based recommendation, then `AskUserQuestion` asks the user. Never pre-decide or skip the ask with fabricated reasons ("tool unavailable", "default inline") — SKILL.md has no fallback.
+Before invoking the skill, **never**:
+- write pre-questions ("ready to start? / shall I proceed?")
+- state "I lean towards X" or text-preview the inline/subagent options
+- surface Step 1.7 rationale ahead of time
 
-**The only action when entering Phase 2.1 / 2.2 / 3.1**: directly call `Skill({skill: "trellis-route", args: "target=implement|check"})`.
+Why: pre-invoke chatter creates double-asking, forces users to reply in prose instead of using the skill's number shortcuts (1/2/3/4), and breaks the routing path.
 
-Before invoking the skill, **never** do any of these in the main conversation:
-- write pre-questions like "ready to start? / shall I proceed? / I'll call it in my next message"
-- state "I lean towards X" or text-preview inline/subagent options
-- surface Step 1.7 recommendation rationale / Step 2 options ahead of time
+### Override B — Anti-defer rule (long-form details)
 
-Why: Step 1.7's recommendation is generated inside the skill and surfaced via Step 2's `AskUserQuestion` — the **only** prompt point. Pre-invoke chatter creates double-asking, forces users to reply in prose instead of using number shortcuts, and breaks the routing path.
+The per-turn ANTI-DEFER summarizes; here are the three forbidden patterns in full.
 
-### Override B — `workflow-state:in_progress` refinements
+1. **Asking a meta continuation question instead of invoking trellis-route.** Mechanical check: if your draft response would end with an open-ended "should I X or Y?" and the answer determines the next workflow phase, replace it with `Skill({skill: "trellis-route", args: "target=..."})`.
 
-The upstream `[workflow-state:in_progress]` body already states (1) default no-inline, (2) use exact agent type names, (3) per-turn escape hatch — keep those. One refinement on top:
+2. **Treating PRD-level PR1/PR2/PR3 multi-PR plans as Trellis phase boundaries.** PRs in the PRD are an implementation strategy for code-review readability — they are NOT `trellis-implement` → `trellis-check` boundaries. The `implement` phase ends when the WHOLE task is structurally done (or at a deliberate user-requested pause).
 
-- **Flow** is `trellis-route(implement) → trellis-route(check) → trellis-update-spec → finish` (replaces upstream `trellis-implement → trellis-check → ...`).
+3. **Inferring an inline override from a prior user turn.** "User said 'inline' two turns ago" is NOT a license to skip `trellis-route` on the current turn. Each turn at a phase boundary needs its own routing decision.
+
+**Worked example of a real violation** (committed by an Opus session, 2026-05-08, before this rule existed):
+
+> Context: just finished refactoring a 2k-line script (PR1 of a 3-PR plan listed in the PRD).
+>
+> ❌ What the model said:
+> > "PR1 done, quality gates green, 18/18 tests pass. Want me to keep going inline with PR2, or pause for you to review first?"
+>
+> ✅ What the model should have said (and done):
+> > Either:
+> > (a) Continue PR2/PR3 inline silently (since the plan was a single implement phase and the user already said "inline" for it), or
+> > (b) Invoke `Skill({skill: "trellis-route", args: "target=check"})` to surface the choice through the routing skill instead of free-form chat.
+> >
+> > In either case, NO meta question to the user.
 
 <!-- END skill-garden enhancement v0.5 -->
 
@@ -546,12 +559,10 @@ After the above, remind the user they can run `/finish-work` to wrap up (archive
 
 [workflow-state:no_task]
 <!-- BEGIN skill-garden workflow-state no-task-gate v0.5 -->
-CRITICAL POST-TASK HANDOFF:
-If you create or resume a Trellis task in this turn, task creation is not permission to implement inline.
-After the PRD/context is ready and the task is started, the next implementation action is Phase 2.1 and must go through `trellis-route(implement)`.
-If the task is still planning, continue requirements/context work only; do not write implementation code.
-Only skip Trellis when the current user message explicitly opts out with phrases like "skip trellis", "no task", "just do it", "直接改", or "先别建任务".
-Do not infer opt-out from urgency, small scope, or missing details.
+POST-TASK HANDOFF:
+Creating/resuming a task ≠ permission to implement inline.
+After PRD ready and task started, next impl action = `trellis-route(implement)`.
+Don't infer opt-out from "small/urgent/unclear" — opt-out requires an explicit phrase in the current message (see C below).
 <!-- END skill-garden workflow-state no-task-gate v0.5 -->
 
 No active task. **A Direct answer** — pure Q&A / explanation / lookup / chat; no file writes + one-line answer + repo reads ≤ 2 files → AI judges, no override needed.
@@ -561,10 +572,10 @@ No active task. **A Direct answer** — pure Q&A / explanation / lookup / chat; 
 
 [workflow-state:planning]
 <!-- BEGIN skill-garden workflow-state planning-handoff v0.5 -->
-CRITICAL PLANNING HANDOFF:
+PLANNING HANDOFF:
 Planning is not implementation permission.
-Complete or update `prd.md` and required context first.
-After the task moves to `in_progress`, the next action is `trellis-route(implement)`, not editing files directly.
+Complete prd.md + context first.
+After in_progress, next action = `trellis-route(implement)`, not direct edits.
 <!-- END skill-garden workflow-state planning-handoff v0.5 -->
 
 Load the `trellis-brainstorm` skill and iterate on prd.md with the user.
@@ -575,11 +586,10 @@ Research output **must** land in `{task_dir}/research/*.md`, written by `trellis
 
 [workflow-state:in_progress]
 <!-- BEGIN skill-garden workflow-state trellis-route v0.5 -->
-CRITICAL ROUTING OVERRIDE:
-If the next action is implementation, quality check, or final quality verification, invoke `trellis-route` first.
-Required flow:
-`trellis-route(implement)` → run the selected implementation path → `trellis-route(check)` → run the selected check path → `trellis-update-spec` → finish.
-This rule overrides any older wording below that directly calls `trellis-implement` / `trellis-check`.
+ROUTING OVERRIDE:
+At Phase 2.1/2.2/3.1, invoke `trellis-route(implement|check)` — never call `trellis-implement`/`trellis-check` sub-agents directly.
+Flow: trellis-route(implement) → trellis-route(check) → trellis-update-spec → finish.
+ANTI-DEFER: at phase boundaries, never ask meta questions ("X or Y?", "continue?", "what's next?") — invoke `trellis-route(check)` instead. PRD sub-PRs ≠ phase boundaries. Prior "inline" applies to that turn only.
 <!-- END skill-garden workflow-state trellis-route v0.5 -->
 
 **Flow**: trellis-implement → trellis-check → trellis-update-spec → commit (Phase 3.4) → `/trellis:finish-work`.
