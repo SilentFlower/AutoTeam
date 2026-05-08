@@ -208,3 +208,40 @@ fix sub2api token_invalidated 401: 主流程加 Step C(remove 后 OAuth 拿 pers
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: Plus 号池接入注册机:注册→付款→OAuth→推送 Sub2API 全链路
+
+**Date**: 2026-05-08
+**Task**: Plus 号池接入注册机:注册→付款→OAuth→推送 Sub2API 全链路
+**Branch**: `new`
+
+### Summary
+
+PR1 库化注册机(BotConfig + register_one_plus + OTP callback 注入,18 单测);PR2 后端 plus_auto_register 模块 + 4 HTTP 端点(asyncio thread + queue.Queue OTP + threading.Lock + 跨线程 task.cancel,19 单测,0 回归);PR3 前端 PlusPage 按钮/进度面板/OTP 弹框/轮询 + .env.example/README/configuration 文档;check-all 修复 R3.5 错误消息 + PRD AC3/D5 与 Technical Approach 对齐;spec error-handling.md 沉淀两条工程模式(跨线程 asyncio 协作 + 双阶段失败语义)。共 7 commit。e2e 真实跑通 + PlusPage 手动验收待用户本机执行。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `c070158` | (see git log) |
+| `aaace5a` | (see git log) |
+| `ad0f13b` | (see git log) |
+| `588c93d` | (see git log) |
+| `c09497c` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
