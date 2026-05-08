@@ -75,7 +75,7 @@
   - 启动期校验:服务启动时不强制要求 GoPay 配置(允许只用 import 不用 auto-register);**首次调用 auto-register 端点时**校验缺失,返回 400 + 明确错误。
 
 * D5 (OTP 等待与 abort,2026-05-08):
-  - OTP 输入超时:**5 分钟**(常量 `OTP_WAIT_TIMEOUT_SECONDS = 300`),超时后整单 `step=awaiting_whatsapp_otp` 失败,留 `status=auth_failed`(方便 reauth);
+  - OTP 输入超时:**5 分钟**(常量 `OTP_WAIT_TIMEOUT_SECONDS = 300`),超时后整单 `step=awaiting_whatsapp_otp` 失败,`error_type=whatsapp_otp_timeout`,**不写 `plus_accounts.json`**(在设密码前失败,无 (email, password) 给 reauth 用 —— 仅 OAuth 阶段失败的号才走 status=auth_failed/reauth 路径,详见 Technical Approach §错误分类);
   - **abort 入口**:PlusPage 进度条加「取消」按钮 → `POST /api/plus/auto_register/{job_id}/cancel`,后端杀浏览器、job 标 `cancelled`、已付款不退(运营手动处置)。
 
 * D6 (批量失败回流,2026-05-08):**逐个独立提交**(对齐 FREE 池):
@@ -128,7 +128,7 @@
 
 * [ ] 启动服务后 `POST /api/plus/auto_register {"count":1}` 返回 job_id,15 分钟内完成全链路并在 `data/admins/{admin_id}/plus_accounts.json` 出现 `status=active` 的新记录。
 * [ ] 同一记录的 `auth_file` 文件存在,`sync_plus_to_sub2api(admin_id)` 验证该号已上 sub2api。
-* [ ] WhatsApp OTP 步触发时,job 状态变 `awaiting_otp`;5 分钟内未喂 OTP → 整单 `status=auth_failed`(可 reauth);喂入正确 OTP → 流程继续。
+* [ ] WhatsApp OTP 步触发时,job 状态变 `awaiting_otp`;5 分钟内未喂 OTP → 整单 ok=False,`error_type=whatsapp_otp_timeout`,**不写 `plus_accounts.json`**(register_one_plus 在设密码前失败,无 (email, password) 给 reauth 用,与 Technical Approach §错误分类一致);喂入正确 OTP → 流程继续。
 * [ ] `POST /cancel` 在任意步生效:浏览器关、job 标 `cancelled`、不写 plus_accounts.json。
 * [ ] 缺 `GOPAY_PIN` 时调 auto_register 返回 400 + 中文错误「请在 .env 中填写 GOPAY_PIN(6 位数字)」。
 * [ ] 批量 count=3 时,第 2 个失败不影响第 1、3 号入池,summary 字段正确。
@@ -291,3 +291,9 @@ PlusPage 持续轮询 GET /api/plus/auto_register/{job_id}
 * **JSON 持久化**(backend spec `database-guidelines.md`):job 状态只在内存,服务重启即丢(ok,生命周期 < 1 小时,重启场景罕见);plus_accounts.json 走现有原子写入。
 * **Playwright 资源回收**:cancel 时 `await browser.close()` 必须在 try/finally;register_lock 释放时机要在 close 之后。
 * **MVP 不做的事再次强调**:不重试、不退款、不补池、不并发。
+
+## 变更记录
+
+* 2026-05-08(check-all 阶段):
+  - **AC3 / D5 修正**:把"OTP 5 分钟超时 → 整单 status=auth_failed(可 reauth)"改为"整单 ok=False,error_type=whatsapp_otp_timeout,不写 plus_accounts.json"。原文与 Technical Approach §错误分类(line 207)矛盾——"仅 oauth_failed 走 import_plus_account 失败路径(status=auth_failed 留待 reauth);其余在 import 之前失败,不写 plus_accounts.json(没有可 reauth 的资料)"。OTP 超时时 register_one_plus 在设密码步前已退出,ChatGPT 账号没绑定密码,(email, password) reauth 无法工作,故按 Technical Approach 落地。
+  - **R3.5 配置缺失错误消息细化**:`load_bot_config_from_env` 的 ValueError 文案从`"以下环境变量缺失,请在 .env 中填写后重启服务:GOPAY_PIN"`增强为`"...:GOPAY_PIN(GoPay 6 位数字支付 PIN), GOPAY_PHONE(GoPay 手机号纯数字...) ..."`,逐项附格式提示,与 spec/backend/error-handling.md 的"告诉用户下一步"对齐。
