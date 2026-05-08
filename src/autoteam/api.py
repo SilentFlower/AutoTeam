@@ -2915,6 +2915,24 @@ class PlusCheckQuotaParams(BaseModel):
     emails: list[str] | None = None
 
 
+class PlusAutoRegisterParams(BaseModel):
+    """``POST /api/plus/auto_register`` 入参。
+
+    :param count: 本次批量自动注册的目标数量,默认 1,必须 >= 1。
+    """
+
+    count: int = 1
+
+
+class PlusAutoRegisterFeedOtpParams(BaseModel):
+    """``POST /api/plus/auto_register/{job_id}/feed_otp`` 入参。
+
+    :param otp: 用户从 WhatsApp/短信 复制的 GoPay OTP 验证码;通常是 6 位数字。
+    """
+
+    otp: str
+
+
 def _sanitize_free_record(rec: dict) -> dict:
     """返回前端可见的免费号 dict。
 
@@ -3236,6 +3254,114 @@ def delete_plus_email(email: str, admin_id: str | None = Depends(get_current_adm
         }
     finally:
         _playwright_lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Plus 号自动注册端点(PRD 05-08-plus-oauth-sub2api / R3)
+# ---------------------------------------------------------------------------
+#
+# 把根目录 chatgpt_registration_bot_public.py 的批量注册能力暴露给 Web UI:
+# 注册→ GoPay 付款 → WhatsApp OTP → 设密码 → 取消续订 → OAuth → sub2api 同步
+# 全链路自动化。WhatsApp OTP 走"job 状态 awaiting_whatsapp_otp + feed_otp 端点"
+# 双向通信(PRD D2 方案 A),不引入 WebSocket / 推送。串行约束:GoPay 单实体
+# 账号 + Playwright 单浏览器,所有 job 通过 plus_auto_register 模块全局锁串行。
+
+
+@app.post("/api/plus/auto_register", status_code=202)
+def post_plus_auto_register(
+    params: PlusAutoRegisterParams,
+    admin_id: str | None = Depends(get_current_admin_id),
+):
+    """提交一个批量 Plus 号自动注册任务,返回 ``{job_id}``。
+
+    缺 ``.env`` 配置(``GOPAY_PHONE`` / ``GOPAY_COUNTRY_CODE`` / ``GOPAY_PIN`` /
+    ``CF_TEMP_EMAIL_BASE_URL``)时返回 400 + 中文指引;有任务在跑返回 409。
+
+    :param params: 含 ``count`` 字段的请求体。
+    :param admin_id: 目标 admin;缺省由后续 ``import_plus_account`` 内部回退激活 admin。
+    :return: ``{"job_id": "<12 位 hex>"}``。
+    """
+    if params.count <= 0:
+        raise HTTPException(status_code=400, detail="生成数量必须为正整数")
+
+    from autoteam.plus_auto_register import submit_auto_register_job
+
+    try:
+        job_id = submit_auto_register_job(params.count, admin_id)
+    except ValueError as exc:
+        # 配置缺失 / 参数非法,前端原样展示中文指引
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        # 已有 Playwright 任务在跑
+        raise HTTPException(
+            status_code=409,
+            detail=_current_busy_detail(str(exc)),
+        ) from exc
+    return {"job_id": job_id}
+
+
+@app.get("/api/plus/auto_register/{job_id}")
+def get_plus_auto_register_job(job_id: str):
+    """查询自动注册 job 状态,前端轮询入口。
+
+    :param job_id: ``submit`` 端点返回的 12 位 hex。
+    :return: job 状态快照(包含 ``status / step / current_index / total / ok /
+        errors / summary / otp_request_at / started_at / finished_at /
+        admin_id``)。job 不存在返回 404。
+    """
+    from autoteam.plus_auto_register import get_job
+
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"未知 job_id: {job_id}")
+    return job
+
+
+@app.post("/api/plus/auto_register/{job_id}/feed_otp")
+def post_plus_auto_register_feed_otp(
+    job_id: str,
+    params: PlusAutoRegisterFeedOtpParams,
+):
+    """喂 WhatsApp OTP 给等待中的 job(PRD D2)。
+
+    :raises HTTPException 400: ``otp`` 为空。
+    :raises HTTPException 404: job 不存在。
+    :raises HTTPException 409: job 当前不在 ``awaiting_whatsapp_otp`` 步,
+        或队列已有 OTP 排队。
+    :return: ``{"ok": true}``。
+    """
+    otp = params.otp.strip()
+    if not otp:
+        raise HTTPException(status_code=400, detail="OTP 不能为空")
+
+    from autoteam.plus_auto_register import feed_otp
+
+    try:
+        feed_otp(job_id, otp)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@app.post("/api/plus/auto_register/{job_id}/cancel")
+def post_plus_auto_register_cancel(job_id: str):
+    """请求取消正在跑的自动注册 job(PRD D5)。
+
+    cancel 是幂等的:终态 job 直接返回成功,不重复释放锁/状态。底层通过
+    ``task.cancel()`` + OTP queue sentinel 双路兜底唤醒。
+
+    :raises HTTPException 404: job 不存在。
+    :return: ``{"ok": true}``。
+    """
+    from autoteam.plus_auto_register import cancel_job
+
+    try:
+        cancel_job(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
