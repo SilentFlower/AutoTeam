@@ -323,6 +323,159 @@ def begin_admin_login_for_new(email):
 
 ---
 
+## 跨线程 + asyncio 协作:thread 跑 loop 时锁与 cancel 的正确姿势
+
+**适用场景**:长任务跑在后台 thread 里(避免阻塞 FastAPI 的同步端点函数),但内部又必须用 asyncio(Playwright / async HTTP 库)。同时前端通过 HTTP 端点同步触发"中段交互"(喂 OTP)与"取消"。
+
+真例:`src/autoteam/plus_auto_register.py`(Plus 号自动注册)。
+
+### 反模式:用 asyncio.Lock 跨 thread
+
+```python
+# ❌ 反模式
+_register_lock = asyncio.Lock()  # 同 loop 内有效,跨 thread 不工作
+
+def submit_job():
+    threading.Thread(target=_run, daemon=True).start()
+
+def _run():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(_run_async())
+
+async def _run_async():
+    async with _register_lock:  # 第二个 thread 拿到的是另一个 loop 上的锁,无法互斥
+        await register_one_plus(...)
+```
+
+`asyncio.Lock` 绑定到当前 event loop;每个 thread 用 `asyncio.new_event_loop()` 启动后拿到的是**独立 loop**,互不感知,锁形同虚设。
+
+### 正确做法:threading.Lock + 独立 loop + call_soon_threadsafe
+
+```python
+# ✅ 正确
+_register_lock = threading.Lock()  # 跨 thread 真互斥
+_job_loops: dict[str, asyncio.AbstractEventLoop] = {}
+_job_tasks: dict[str, asyncio.Task] = {}
+
+def submit_job() -> str:
+    job_id = uuid.uuid4().hex[:12]
+    threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
+    return job_id
+
+def _run_job(job_id):
+    _register_lock.acquire()           # 跨 thread 真互斥
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _job_loops[job_id] = loop
+        try:
+            task = loop.create_task(_run_async(job_id))
+            _job_tasks[job_id] = task  # 暴露给 cancel_job 跨线程取消
+            loop.run_until_complete(task)
+        finally:
+            _job_loops.pop(job_id, None)
+            _job_tasks.pop(job_id, None)
+            loop.close()
+    finally:
+        _register_lock.release()
+
+def cancel_job(job_id):
+    """同步端点(主线程)发起取消,需要跨线程让 task.cancel 在目标 loop 里跑。"""
+    loop = _job_loops.get(job_id)
+    task = _job_tasks.get(job_id)
+    if loop and task and not task.done():
+        loop.call_soon_threadsafe(task.cancel)  # 不能直接 task.cancel(),因为不在同 loop
+```
+
+### 中段交互:用 queue.Queue + sentinel 桥接同步端点 ↔ asyncio
+
+前端 HTTP 端点(同步)往 `queue.Queue` 推值,asyncio 协程用 `loop.run_in_executor(None, q.get, timeout)` 在 executor 里阻塞等待——把同步阻塞 IO 转成 async 友好的等待。
+
+```python
+# 端点(同步线程)
+def feed_otp_endpoint(job_id, otp):
+    _otp_queues[job_id].put_nowait(otp)
+
+def cancel_endpoint(job_id):
+    _otp_queues[job_id].put_nowait(None)  # sentinel 唤醒等待的 callback
+
+# asyncio 协程
+async def otp_callback():
+    loop = asyncio.get_running_loop()
+    try:
+        otp = await loop.run_in_executor(None, lambda: q.get(timeout=300))
+    except queue.Empty:
+        return None
+    return otp  # None = sentinel(cancel)
+```
+
+### Checklist
+
+- [ ] thread 启动 loop 时锁用 `threading.Lock` 而非 `asyncio.Lock`?
+- [ ] 跨线程 cancel 用 `loop.call_soon_threadsafe(task.cancel)` 而非 `task.cancel()`?
+- [ ] 同步端点 ↔ asyncio 跨界数据通道用 `queue.Queue`(线程安全)而非 `asyncio.Queue`?
+- [ ] Cancel 路径有 sentinel 兜底唤醒,避免单纯 `task.cancel` 漏到深 await 点失效?
+- [ ] thread 主体最外层 try/finally 释放锁,否则异常时锁会泄漏?
+
+---
+
+## 双阶段流程的失败语义:落库的判断标准
+
+**适用场景**:业务流程分两阶段(注册 → OAuth、邀请 → 接受、付款 → 入库等),中间任意阶段都可能失败。常见误区:所有失败都落库,后续 reauth/重试因数据不全静默失败。
+
+真例:`src/autoteam/plus_auto_register.py`(Plus 自动注册:register 阶段含 GoPay 付款 + ChatGPT 设密码;OAuth 阶段调 `import_plus_account`)。
+
+### 判断标准:落库后能否走 reauth/重试?
+
+每条失败记录写入 JSON 都隐含承诺"用户后续可以救活它"。如果落库后没有可用的 (email, password) 给重试函数,这条记录就是僵尸——既无法 reauth 又因业务约束(如"禁止删除唯一资源"、级联清理需要远端 ID)而难以清理。
+
+```python
+# Plus 自动注册的失败分类(plus_auto_register.py)
+if not register_result.ok:
+    # register 阶段失败(注册 / 付款 / OTP 超时):
+    # ChatGPT 账号没设密码,无 (email, password) 给 reauth_plus_account 用,
+    # 强制落库会产生"既不能 reauth 又难删"的僵尸记录。
+    # → 不写 plus_accounts.json,只在 job.errors 登记并展示给用户。
+    summary["other_failed"] += 1
+    continue
+
+# register 成功 → 调 import_plus_account(OAuth + sub2api 同步)
+import_result = import_plus_account(email, password, admin_id)
+if not import_result.ok:
+    # OAuth 阶段失败:ChatGPT 账号已设密码,(email, password) 完整,
+    # → 写 status=auth_failed,用户可在 PlusPage 点「重新登录」走 reauth_plus_account。
+    summary["auth_failed"] += 1
+```
+
+### 反模式:无差别落库
+
+```python
+# ❌ 反模式:任何失败都落库
+try:
+    register(email)
+    oauth(email, password)
+    save({"email": email, "password": password, "status": "active"})
+except Exception:
+    save({"email": email, "password": "", "status": "auth_failed"})  # 没密码也落!
+```
+
+副作用:
+- reauth 入口拿到没密码的记录会失败 → 用户疑惑;
+- 级联删除需要远端账号 ID,没注册成功的号没 ID → 删除路径残留;
+- "禁止删除唯一资源"等业务约束 + 僵尸记录 = 死锁(参考"资源创建与回滚一致性"段同类反例)。
+
+### Checklist
+
+引入双阶段(或多阶段)流程时:
+
+- [ ] 列清楚每个阶段失败时**已经产生**的状态(资源是否已创建 / 凭据是否完整 / 远端是否扣款)?
+- [ ] 失败落库前问:这条记录能给后续重试函数(reauth / retry)提供完整入参吗?不能就**别落**;
+- [ ] 不落的那部分错误,是否在 job 状态 / 日志 / 前端 toast 里有去处,让用户知道发生了什么?
+- [ ] 单元测试是否覆盖"早期阶段失败 → 不落库"和"晚期阶段失败 → 落库走 reauth"两条独立路径?
+
+---
+
 ## 常见错误
 
 1. **写新异常类前没问"调用方真的需要分支处理吗"**——大多数情况 `RuntimeError(f"…")` 就够了。
@@ -332,3 +485,5 @@ def begin_admin_login_for_new(email):
 5. **业务模块 catch 后既不重抛也不记日志**——典型的"静默失败"，最难排查。
 6. **资源创建过早写持久化、异常路径不回滚**——会留空壳与业务约束(如"禁止删除唯一资源")冲突,见上方"资源创建与回滚一致性"章节。
 7. **用 `try/except TypeError` 适配函数签名变化**——会吞掉 func 内部真实 TypeError,改用 `inspect.signature` 探测,见"动态参数适配"章节。
+8. **后台 thread 跑 asyncio loop 时用 `asyncio.Lock`**——跨 thread 完全失效,改用 `threading.Lock`;cancel 同理用 `loop.call_soon_threadsafe(task.cancel)`,见"跨线程 + asyncio 协作"章节。
+9. **多阶段流程失败一律落库**——产生没有 (email, password) 等可重试入参的僵尸记录,reauth 入口失败,删除路径残留;落库前先判断"这条记录能给后续重试提供完整入参吗",见"双阶段流程的失败语义"章节。
