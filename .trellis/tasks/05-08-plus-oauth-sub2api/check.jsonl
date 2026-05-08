@@ -1,0 +1,8 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "提交前自检清单(ruff/pytest/compileall)是 check 通过门槛。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "lint/format/test 命令与 PR/commit 规范,check 阶段直接对照执行。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验 HTTPException 中文消息 + 下一步指引、error_type 分类是否齐全。"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "校验日志中无 OTP/PIN/token/password 明文,脱敏正确。"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "校验 plus_accounts.json 写入走原子方式,字段命名与现有一致。"}
+{"file": ".trellis/tasks/05-08-plus-oauth-sub2api/prd.md", "reason": "Acceptance Criteria 与 Definition of Done 是 check 阶段最终验收清单。"}
+{"file": ".trellis/tasks/05-08-plus-oauth-sub2api/research/integration-map.md", "reason": "校验衔接点(import_plus_account / OAuth / sub2api 同步)是否被正确复用,没有重复造轮子。"}
+{"file": ".trellis/tasks/05-08-plus-oauth-sub2api/research/registration-bot-mapping.md", "reason": "校验 PR1 库化改造范围未越界(只改约定的 4 处:BotConfig / OTP callback / register_one_plus / AccountManager 隔离)。"}

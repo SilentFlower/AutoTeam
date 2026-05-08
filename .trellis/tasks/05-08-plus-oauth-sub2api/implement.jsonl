@@ -1,0 +1,8 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "后端总规约入口,含 Python/uv/FastAPI/JSON 持久化/Ruff/pytest 项目快照与提交前自检清单。"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "新增 src/autoteam/plus_auto_register.py 模块,需要遵循扁平结构与命名约定。"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "JSON 持久化(plus_accounts.json)字段命名、原子写入、向后兼容约定;新模块 job 状态保留内存即可。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "HTTPException.detail 必须中文 + 给下一步指引;error_type 分类影响前端展示与 reauth 决策。"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "OTP / PIN / password / accessToken 不进 logger,统一脱敏为前 2 位 + ***。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "ruff/pytest/compileall 四件套,实施完成必须本地全绿。"}
+{"file": ".trellis/tasks/05-08-plus-oauth-sub2api/research/integration-map.md", "reason": "Plus 池 / OAuth / sub2api / FREE 池 完整代码地图(file:line)——本任务衔接 import_plus_account 的依据。"}
+{"file": ".trellis/tasks/05-08-plus-oauth-sub2api/research/registration-bot-mapping.md", "reason": "注册机 2156 行结构与 PR1 库化改造点逐处定位,避免 implement 子 agent 重新通读全文件。"}
