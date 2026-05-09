@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 
 from autoteam import plus_auto_register
-from chatgpt_registration_bot_public import BotConfig
+from autoteam.plus_register_bot import BotConfig
 
 # =============================================================================
 # Fixtures
@@ -35,15 +35,35 @@ def _reset_state():
 
 @pytest.fixture
 def fake_config(monkeypatch):
-    """让 ``load_bot_config_from_env`` 直接返回合法 ``BotConfig``。"""
+    """让 ``load_bot_config_from_env`` 直接返回合法 ``BotConfig``。
+
+    同时把 ``mail_provider.get_mail_client`` 替成无网络副作用的默认替身,
+    防止 `_run_job_async` 在大多数测试里提前真实登录 CloudMail。
+    """
     cfg = BotConfig(
-        temp_email_api="https://mail.example.com",
-        temp_email_login_base="https://mail.example.com",
         gopay_phone="13800138000",
         gopay_country_code="86",
         gopay_pin="123456",
     )
+
+    class _NoopMailClient:
+        def login(self):
+            return None
+
+        def create_temp_email(self, prefix=None):
+            return "acc-noop", "noop@example.com"
+
+        def wait_for_email(self, to_email, timeout=None):
+            return {"subject": "Your code is 654321", "text": "654321"}
+
+        def extract_verification_code(self, email_data):
+            return "654321"
+
+        def delete_account(self, account_id):
+            return None
+
     monkeypatch.setattr(plus_auto_register, "load_bot_config_from_env", lambda: cfg)
+    monkeypatch.setattr("autoteam.mail_provider.get_mail_client", lambda provider=None: _NoopMailClient())
     return cfg
 
 
@@ -93,19 +113,17 @@ def _wait_step(job_id: str, target_step: str, timeout: float = 5.0):
 # load_bot_config_from_env
 # =============================================================================
 def test_load_bot_config_missing_env_raises(monkeypatch):
-    """4 项必填环境变量任意缺失都应抛 ``ValueError``。"""
-    monkeypatch.delenv("CF_TEMP_EMAIL_BASE_URL", raising=False)
+    """3 项 GoPay 必填环境变量任意缺失都应抛 ``ValueError``。"""
     monkeypatch.delenv("GOPAY_PHONE", raising=False)
     monkeypatch.delenv("GOPAY_COUNTRY_CODE", raising=False)
     monkeypatch.delenv("GOPAY_PIN", raising=False)
 
-    with pytest.raises(ValueError, match="CF_TEMP_EMAIL_BASE_URL"):
+    with pytest.raises(ValueError, match="GOPAY_PHONE"):
         plus_auto_register.load_bot_config_from_env()
 
 
 def test_load_bot_config_partial_missing(monkeypatch):
     """只缺一项也要在异常消息里命名出来。"""
-    monkeypatch.setenv("CF_TEMP_EMAIL_BASE_URL", "https://m.example.com")
     monkeypatch.setenv("GOPAY_PHONE", "13800138000")
     monkeypatch.setenv("GOPAY_COUNTRY_CODE", "86")
     monkeypatch.delenv("GOPAY_PIN", raising=False)
@@ -116,21 +134,18 @@ def test_load_bot_config_partial_missing(monkeypatch):
 
 def test_load_bot_config_returns_botconfig(monkeypatch):
     """全部齐备时返回合法 BotConfig 实例。"""
-    monkeypatch.setenv("CF_TEMP_EMAIL_BASE_URL", "https://m.example.com/")
     monkeypatch.setenv("GOPAY_PHONE", "13800138000")
     monkeypatch.setenv("GOPAY_COUNTRY_CODE", "86")
     monkeypatch.setenv("GOPAY_PIN", "123456")
 
     cfg = plus_auto_register.load_bot_config_from_env()
     assert isinstance(cfg, BotConfig)
-    # 末尾斜杠应被去掉
-    assert cfg.temp_email_api == "https://m.example.com"
+    assert cfg.gopay_phone == "13800138000"
     assert cfg.gopay_pin == "123456"
 
 
 def test_load_bot_config_error_message_includes_format_hint(monkeypatch):
     """缺项异常消息应附每个字段的格式提示(R3.5 要求"具体到 6 位数字"等)。"""
-    monkeypatch.setenv("CF_TEMP_EMAIL_BASE_URL", "https://m.example.com")
     monkeypatch.setenv("GOPAY_PHONE", "13800138000")
     monkeypatch.delenv("GOPAY_COUNTRY_CODE", raising=False)
     monkeypatch.delenv("GOPAY_PIN", raising=False)
@@ -138,11 +153,10 @@ def test_load_bot_config_error_message_includes_format_hint(monkeypatch):
     with pytest.raises(ValueError) as excinfo:
         plus_auto_register.load_bot_config_from_env()
     msg = str(excinfo.value)
-    # 字段名 + 格式提示并存
     assert "GOPAY_PIN" in msg
-    assert "6 位" in msg  # PIN 格式提示
+    assert "6 位" in msg
     assert "GOPAY_COUNTRY_CODE" in msg
-    assert "国家码" in msg  # 国家码格式提示
+    assert "国家码" in msg
 
 
 # =============================================================================
@@ -254,6 +268,60 @@ def test_happy_path_single(monkeypatch, fake_config, fake_import):
     }
     # import_plus_account 实际被调
     assert fake_import.calls == [("stub@example.com", "p@ssw0rd", None)]
+
+
+def test_register_receives_mailbox_callbacks(monkeypatch, fake_config, fake_import):
+    """_run_job_async 必须把 create/fetch/cleanup 三个 mailbox callback 注给 register_one_plus。"""
+    seen: dict[str, Any] = {}
+
+    class _FakeMailClient:
+        def login(self):
+            seen["login_called"] = True
+
+        def create_temp_email(self, prefix=None):
+            seen["prefix"] = prefix
+            return "acc-1", "mailbox@example.com"
+
+        def wait_for_email(self, to_email, timeout=None):
+            seen["wait_for_email"] = (to_email, timeout)
+            return {"subject": "Your code is 654321", "text": "654321"}
+
+        def extract_verification_code(self, email_data):
+            seen["extract_verification_code"] = email_data
+            return "654321"
+
+        def delete_account(self, account_id):
+            seen["delete_account"] = account_id
+
+    monkeypatch.setattr("autoteam.mail_provider.get_mail_client", lambda provider=None: _FakeMailClient())
+
+    async def _stub(
+        *, config, otp_callback, create_mailbox, fetch_email_code, cleanup_mailbox, step_callback=None, **kwargs
+    ):
+        mailbox = await create_mailbox()
+        seen["mailbox"] = mailbox
+        code = await fetch_email_code(mailbox, 180)
+        seen["code"] = code
+        await cleanup_mailbox(mailbox)
+        return {
+            "ok": True,
+            "email": mailbox["email"],
+            "password": "p@ssw0rd",
+            "last_step": "done",
+            "error_type": None,
+            "error_detail": None,
+        }
+
+    monkeypatch.setattr(plus_auto_register, "register_one_plus", _stub)
+
+    job_id = plus_auto_register.submit_auto_register_job(1, None)
+    _wait_status(job_id, {plus_auto_register.JOB_STATUS_DONE})
+
+    assert seen["login_called"] is True
+    assert seen["mailbox"] == {"account_id": "acc-1", "email": "mailbox@example.com"}
+    assert seen["wait_for_email"] == ("mailbox@example.com", 180)
+    assert seen["code"] == "654321"
+    assert seen["delete_account"] == "acc-1"
 
 
 def test_payment_failed_recorded(monkeypatch, fake_config, fake_import):

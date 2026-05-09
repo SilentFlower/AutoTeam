@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "后端总规约 + 提交前自检清单(ruff/pytest/compileall);本任务跨模块迁移必须严守。"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "新增 src/autoteam/plus_register_bot.py 必须遵循扁平结构与 snake_case 命名约定。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "自定义异常用 RuntimeError/ValueError 优先;HTTPException 中文 detail;此前已沉淀的 双阶段失败语义 + 跨线程 asyncio 真例需要更新引用路径。"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "新模块需用 logger = logging.getLogger(__name__) + 中文模块前缀 + %s 占位 + 不打 password/OTP/token。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "ruff/pytest/compileall 四件套是迁移完成的硬门槛。"}
+{"file": ".trellis/tasks/05-08-plus-oauth-sub2api/research/integration-map.md", "reason": "上一个任务整理的 plus_accounts/import_plus_account/sub2api/mail_provider 衔接点(file:line);本任务沿用,无需重做。"}
+{"file": ".trellis/tasks/05-08-plus-oauth-sub2api/research/registration-bot-mapping.md", "reason": "注册机 2532 行结构与改造点逐处定位;本任务的"删除清单"基于此报告。"}

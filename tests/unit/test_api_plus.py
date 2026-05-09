@@ -59,6 +59,32 @@ def test_post_plus_import_starts_background_task(monkeypatch):
     assert captured["kwargs"] == {"admin_id": "abcd1234"}
 
 
+def test_post_plus_auto_register_requires_mail_and_sync_configs_before_submit(monkeypatch):
+    """自动注册应在提交时同步校验 mail provider + sub2api,避免 202 后后台线程崩掉。"""
+    calls: list[tuple[str, str]] = []
+
+    def fake_require_mail(action_label, *args, **kwargs):
+        calls.append(("mail", action_label))
+
+    def fake_require_sync(action_label, *args, **kwargs):
+        calls.append(("sync", action_label))
+
+    monkeypatch.setattr(api, "_require_mail_provider_configs", fake_require_mail)
+    monkeypatch.setattr(api, "_require_sync_target_configs", fake_require_sync)
+    monkeypatch.setattr(
+        "autoteam.plus_auto_register.submit_auto_register_job",
+        lambda count, admin_id: "job-123",
+    )
+
+    result = api.post_plus_auto_register(api.PlusAutoRegisterParams(count=2), admin_id="abcd1234")
+
+    assert result == {"job_id": "job-123"}
+    assert calls == [
+        ("mail", "自动注册 Plus 号"),
+        ("sync", "自动注册 Plus 号"),
+    ]
+
+
 def test_delete_plus_email_returns_404_when_missing(monkeypatch):
     """删除不存在的 Plus 号应返回 404。"""
     lock_state = {"locked": False}

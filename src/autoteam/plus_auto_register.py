@@ -1,8 +1,7 @@
 """Plus 号自动注册任务编排(PRD task 05-08-plus-oauth-sub2api / R2)。
 
-把根目录注册机 ``chatgpt_registration_bot_public.py`` 的 ``register_one_plus``
-库入口与现有 ``plus_accounts.import_plus_account`` 衔接,封装为 Web UI 可
-轮询的后台 job:
+把 ``autoteam.plus_register_bot.register_one_plus`` 库入口与现有
+``plus_accounts.import_plus_account`` 衔接,封装为 Web UI 可轮询的后台 job:
 
 * job 状态机:``pending → running → done | cancelled | failed``,中间通过
   ``step`` 字段细化(D7 步骤枚举);
@@ -11,7 +10,9 @@
 * ``register_lock``(threading.Lock)叠加 api 模块的 ``_playwright_lock``,
   保证 GoPay 单实体账号 + Playwright 单浏览器双重串行;
 * ``cancel_job`` 通过 ``call_soon_threadsafe(task.cancel)`` 中断 asyncio
-  task,并给 OTP queue 塞 sentinel(None)兜底唤醒等待中的 OTP callback。
+  task,并给 OTP queue 塞 sentinel(None)兜底唤醒等待中的 OTP callback;
+* 临时邮箱完全复用项目既有 ``mail_provider`` 抽象(CloudMail / Cloudflare
+  Temp Email),库模式不再依赖专用临时邮箱客户端。
 
 模块只维护内存 ``_jobs`` 字典,服务重启即丢——job 生命周期 < 1 小时,
 重启时仍在跑的极小概率任务由运营手动 reauth 处置(失败号自动 fall back
@@ -24,21 +25,13 @@ import asyncio
 import logging
 import os
 import queue
-import sys
 import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from pathlib import Path
 from typing import Any
 
-# chatgpt_registration_bot_public.py 位于仓库根(PRD D3 "留根目录"),
-# 安装为 package 后 sys.path 不含仓库根,这里手工注入。
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-from chatgpt_registration_bot_public import BotConfig, register_one_plus  # noqa: E402
+from autoteam.plus_register_bot import BotConfig, MailboxError, generate_email_prefix, register_one_plus
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +81,6 @@ _register_lock = threading.Lock()
 # 各字段的"如何填"提示,缺项错误消息会逐项附上,前端原样展示给用户看
 # (与 spec/backend/error-handling.md 的"告诉用户下一步"约定对齐)。
 _ENV_FIELD_HINT = {
-    "CF_TEMP_EMAIL_BASE_URL": "临时邮箱服务根地址,例 https://mail.example.com",
     "GOPAY_PHONE": "GoPay 手机号纯数字(不带 + 与国家码,例 13800138000)",
     "GOPAY_COUNTRY_CODE": "GoPay 国家码纯数字(例 86 或 62)",
     "GOPAY_PIN": "GoPay 6 位数字支付 PIN",
@@ -98,20 +90,18 @@ _ENV_FIELD_HINT = {
 def load_bot_config_from_env() -> BotConfig:
     """从进程环境变量构造 ``BotConfig``,缺一项直接抛 ``ValueError``。
 
-    PRD D4 规定 GoPay 是单实体账号,注册机配置走全局 ``.env``,而非 per-admin。
-    临时邮箱 API 复用 ``CF_TEMP_EMAIL_BASE_URL``(若与注册机同源)。
+    GoPay 是单实体账号,自动注册配置走全局 ``.env``。临时邮箱配置不再由
+    本函数读取——统一交给 ``mail_provider.get_mail_client()`` 根据
+    ``MAIL_PROVIDER`` + 对应 provider 的 env 自己解析。
 
     :raises ValueError: 任意必填字段缺失或仍为占位符;消息含每项格式提示。
     :return: 已校验的 ``BotConfig`` 实例(``__post_init__`` 通过)。
     """
-    temp_email_api = (os.environ.get("CF_TEMP_EMAIL_BASE_URL") or "").rstrip("/")
     gopay_phone = os.environ.get("GOPAY_PHONE", "").strip()
     gopay_country_code = os.environ.get("GOPAY_COUNTRY_CODE", "").strip()
     gopay_pin = os.environ.get("GOPAY_PIN", "").strip()
 
     missing: list[str] = []
-    if not temp_email_api:
-        missing.append("CF_TEMP_EMAIL_BASE_URL")
     if not gopay_phone:
         missing.append("GOPAY_PHONE")
     if not gopay_country_code:
@@ -119,13 +109,10 @@ def load_bot_config_from_env() -> BotConfig:
     if not gopay_pin:
         missing.append("GOPAY_PIN")
     if missing:
-        # 逐项附格式提示,例:"GOPAY_PIN(GoPay 6 位数字支付 PIN), GOPAY_PHONE(...)"
         details = ", ".join(f"{name}({_ENV_FIELD_HINT.get(name, '必填')})" for name in missing)
         raise ValueError("以下环境变量缺失,请在 .env 中填写后重启服务:" + details)
 
     return BotConfig(
-        temp_email_api=temp_email_api,
-        temp_email_login_base=temp_email_api,
         gopay_phone=gopay_phone,
         gopay_country_code=gopay_country_code,
         gopay_pin=gopay_pin,
@@ -334,6 +321,7 @@ async def _run_job_async(
 
             otp_callback = _make_otp_callback(job_id)
             step_callback = _make_step_callback(job_id)
+            create_mailbox, fetch_email_code, cleanup_mailbox = _build_mailbox_callbacks(config)
 
             logger.info("[Plus自注册] job=%s 开始第 %d/%d 个号", job_id, index + 1, count)
 
@@ -341,8 +329,11 @@ async def _run_job_async(
                 result = await register_one_plus(
                     config=config,
                     otp_callback=otp_callback,
+                    create_mailbox=create_mailbox,
+                    fetch_email_code=fetch_email_code,
+                    cleanup_mailbox=cleanup_mailbox,
                     step_callback=step_callback,
-                    headless=True,
+                    headless=False,
                 )
             except asyncio.CancelledError:
                 # cancel_job 跨线程触发的 task.cancel:登记 cancelled 后跳出循环,
@@ -361,7 +352,6 @@ async def _run_job_async(
             error_type = result.get("error_type")
 
             if not result.get("ok"):
-                # register 阶段失败:直接登记 + 计数
                 if error_type == "cancelled":
                     summary["cancelled"] += 1
                 elif error_type == "payment_failed":
@@ -377,12 +367,9 @@ async def _run_job_async(
                 )
                 continue
 
-            # register 成功:衔接 import_plus_account(OAuth + sub2api 同步)
             password = result.get("password") or ""
             try:
                 step_callback(STEP_OAUTH)
-                # import_plus_account 是同步函数,跑在 executor 防止阻塞 loop;
-                # default-arg 锁定循环变量,避免 B023 lambda 绑定坑。
                 import_result = await asyncio.get_running_loop().run_in_executor(
                     None,
                     lambda e=email, p=password, a=admin_id: _safe_import_plus_account(e, p, a),
@@ -416,6 +403,53 @@ async def _run_job_async(
             logger.info("[Plus自注册] job=%s 第 %d/%d 个号入池: %s", job_id, index + 1, count, email)
     finally:
         _finalize_job(job_id, summary)
+
+
+def _build_mailbox_callbacks(config: BotConfig):
+    """构造 mailbox callback 三件套,把同步 mail_provider client 包成 async。
+
+    注意:mail_client 不是线程安全对象,每个号都新建一份并在当前 worker thread 内
+    使用,避免跨 job 共享 session/token 状态。
+    """
+    from autoteam.mail_provider import get_mail_client
+
+    mail_client = get_mail_client()
+    mail_client.login()
+    loop = asyncio.get_running_loop()
+
+    async def create_mailbox() -> dict[str, Any]:
+        prefix = generate_email_prefix(tag=config.email_prefix_tag)
+
+        def _create():
+            account_id, email = mail_client.create_temp_email(prefix=prefix)
+            return {"account_id": account_id, "email": email}
+
+        return await loop.run_in_executor(None, _create)
+
+    async def fetch_email_code(mailbox: dict[str, Any], timeout: int) -> str | None:
+        email = str(mailbox.get("email") or "")
+        if not email:
+            raise MailboxError("邮箱对象缺少 email 字段,无法等待验证码")
+
+        def _fetch():
+            email_data = mail_client.wait_for_email(email, timeout=timeout)
+            if not email_data:
+                return None
+            return mail_client.extract_verification_code(email_data)
+
+        return await loop.run_in_executor(None, _fetch)
+
+    async def cleanup_mailbox(mailbox: dict[str, Any]) -> None:
+        account_id = mailbox.get("account_id")
+        if not account_id:
+            return
+
+        def _cleanup():
+            mail_client.delete_account(account_id)
+
+        await loop.run_in_executor(None, _cleanup)
+
+    return create_mailbox, fetch_email_code, cleanup_mailbox
 
 
 def _safe_import_plus_account(

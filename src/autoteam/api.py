@@ -3260,7 +3260,7 @@ def delete_plus_email(email: str, admin_id: str | None = Depends(get_current_adm
 # Plus 号自动注册端点(PRD 05-08-plus-oauth-sub2api / R3)
 # ---------------------------------------------------------------------------
 #
-# 把根目录 chatgpt_registration_bot_public.py 的批量注册能力暴露给 Web UI:
+# 把项目内 ``autoteam.plus_register_bot`` 的批量注册能力暴露给 Web UI:
 # 注册→ GoPay 付款 → WhatsApp OTP → 设密码 → 取消续订 → OAuth → sub2api 同步
 # 全链路自动化。WhatsApp OTP 走"job 状态 awaiting_whatsapp_otp + feed_otp 端点"
 # 双向通信(PRD D2 方案 A),不引入 WebSocket / 推送。串行约束:GoPay 单实体
@@ -3283,6 +3283,12 @@ def post_plus_auto_register(
     """
     if params.count <= 0:
         raise HTTPException(status_code=400, detail="生成数量必须为正整数")
+
+    # 自动注册链路在 register 阶段就依赖 mail_provider(创建临时邮箱/收验证码),
+    # OAuth 成功后还会同步到 sub2api,所以提交时就同步校验两类前置配置,
+    # 避免 202 Accepted 后后台线程才因配置缺失崩掉。
+    _require_mail_provider_configs("自动注册 Plus 号")
+    _require_sync_target_configs("自动注册 Plus 号")
 
     from autoteam.plus_auto_register import submit_auto_register_job
 

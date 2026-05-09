@@ -1,32 +1,20 @@
-"""
-ChatGPT 注册机 — 完整自动化流水线
-================================================================
-功能：
-    1. 创建临时邮箱（自托管邮箱服务，可替换）
-    2. ChatGPT 注册（Playwright 浏览器自动化）
-    3. 自动提取邮箱验证码
-    4. GoPay 支付（Stripe → Midtrans → GoPay 印尼区，1 个月免费试用）
-    5. 设置密码、自动取消续订
-    6. 保存到 accounts.json / accounts.txt（含自动登录链接）
+"""ChatGPT Plus 自动注册机器人(浏览器自动化 + 库入口)。
 
-依赖：
-    pip install playwright aiohttp
-    playwright install chromium
+库模式入口:``register_one_plus(config, otp_callback, *, create_mailbox,
+fetch_email_code, cleanup_mailbox, ...)``。临时邮箱通过注入的 callback
+提供,本模块对邮箱实现完全无知 —— 调用方(``plus_auto_register``)负责
+wrap ``autoteam.mail_provider`` 的同步客户端。
 
-使用：
-    python chatgpt_registration_bot_public.py            # 默认全流程
-    python chatgpt_registration_bot_public.py --skip-payment   # 仅注册
-    python chatgpt_registration_bot_public.py --headless       # 无头
+依赖:playwright(已在 pyproject 依赖)。
 
-⚠ 必读：使用前请阅读下方「用户配置区域」并填写所有 YOUR_xxx 占位符，
-否则脚本无法运行。
-================================================================
+注:本模块原是根目录独立 CLI ``chatgpt_registration_bot_public.py``,
+05-08 任务 plus-bot-mail-provider-httpx 整体迁入项目,删除独立 CLI
+专属代码(TempEmailClient / VerificationCodeExtractor / AccountManager /
+WhatsAppOTPHandler / main / aiohttp 依赖)。GoPay 是单实体账号,并发
+会撞同一账号 OTP/PIN,因此调用方必须保证全局串行(见 plus_auto_register)。
 """
 
-import argparse
 import asyncio
-import hashlib
-import json
 import logging
 import os
 import random
@@ -36,101 +24,30 @@ import string
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import datetime
+from typing import Any
 
-# aiohttp 仅在 TempEmailClient 真正发请求时才需要;库模式被 mock 时无需安装。
-# 延后到实际使用时报错,使 BotConfig / register_one_plus 等纯逻辑可以在
-# 没装 aiohttp 的环境(如测试)中也能 import。
-try:
-    import aiohttp  # type: ignore
-except ImportError:  # pragma: no cover - 仅影响真实运行,不影响 mock 测试
-    aiohttp = None  # type: ignore[assignment]
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 
 # ===================== 日志 =====================
-LOG_FILE = os.path.join(os.path.dirname(__file__), "registration_bot.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()],
-)
 logger = logging.getLogger(__name__)
 
-# 全局调试标志
+# 全局调试标志(由调用方按需 set;不再支持 --debug CLI 参数)
 DEBUG_MODE = False
-_bot_instance = None  # 保存 ChatGPTBot 引用，用于调试暂停
 
-# ============================================================================
-# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼  用 户 配 置 区 域 (USER CONFIG)  ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
-# ============================================================================
-# 所有需要你自行填写的内容都集中在这一节。把 "YOUR_xxx" 占位符替换为
-# 你自己的真实值即可。其他章节通常不需要改动。
-# ----------------------------------------------------------------------------
+SCREENSHOTS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "screenshots"))
+os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
-# -------- 1. 临时邮箱服务 ----------------------------------------------------
-# 本脚本依赖一个临时邮箱 API（用来在 ChatGPT 注册时收件、提取 OTP）。
-#
-# 你需要：
-#   ① 自部署一个支持以下接口的邮箱服务（推荐方案，更可控）：
-#        POST {API}/api/new_address     创建地址，返回 {address, password, jwt}
-#        GET  {API}/api/get_emails      传 Authorization 头，返回邮件列表
-#        POST {API}/api/address_login   传 {email, password(sha256)} 登录
-#      （任何兼容 schema 的服务都可以）
-#   ② 或改用公共服务（mail.tm / temp-mail.io 等），但需要修改下方
-#      ⌈TempEmailClient⌋ 类的接口字段。
-#
-# 把下面的 URL 替换成你的服务地址（不要带尾部斜杠）：
-TEMP_EMAIL_API = "https://YOUR_TEMP_EMAIL_API_DOMAIN"
-# 用于生成「自动登录链接」的前缀（一般和上面相同；如有独立 web 入口可改）：
-TEMP_EMAIL_LOGIN_BASE = "https://YOUR_TEMP_EMAIL_API_DOMAIN"
-
-# -------- 2. GoPay 账号信息（订阅支付）---------------------------------------
-# ChatGPT Plus 印尼区订阅走 Stripe → Midtrans → GoPay，需要一个绑定好的
-# GoPay 账号。每次新注册的 ChatGPT 都用同一个 GoPay 账号支付：
-#   - 同一手机号会收到 WhatsApp OTP（一次性，每次不同，仍需手动输入）
-#   - 同一 6 位 PIN（写死，不再询问）
-#
-# 准备工作：
-#   ① 准备一台能装 GoPay App 的手机（Android/iOS 都行）
-#   ② 用一个能收 WhatsApp 的手机号注册 GoPay 并完成 KYC
-#   ③ 在 GoPay App 里设置 6 位 PIN
-#   ④ 把手机号、国家码、PIN 填到下面三行
-#
-# 注意：如果 PIN 填错，付款 OTP 后会卡在 Midtrans 页面无法继续。
-GOPAY_PHONE = "YOUR_GOPAY_PHONE"  # 不带 + 和国家码，纯数字，例 "13800138000"
-GOPAY_COUNTRY_CODE = "YOUR_COUNTRY_CODE"  # 国家码数字，例 "86"（中国）"62"（印尼）
-GOPAY_PIN = "YOUR_6_DIGIT_PIN"  # 6 位 GoPay PIN，例 "123456"
-
-# -------- 3. ChatGPT 注册默认参数 -------------------------------------------
-# 注册时填写的"姓"。命令行 --name 可临时覆盖。
-# 留默认时会自动生成英文随机姓名（推荐）。
+# 静态默认值(原 CLI USER CONFIG 区,迁入项目后保留为模块常量)。
+# DEFAULT_NAME 是 ChatGPTBot 内部 billing 字段 fallback;register_one_plus
+# 库入口默认调 ``generate_real_name()`` 生成真名,不走 fallback。
+# EMAIL_PREFIX_TAG 是 ``generate_email_prefix()`` 在未传 tag 时的默认前缀。
 DEFAULT_NAME = "John Doe"
-
-# 临时邮箱前缀的标记，最终生成形如 "<TAG><YYYYMMDD><随机字符>"，例如
-# 默认会生成 "oai20260507a"。你可以改成自己的标识便于追踪。
 EMAIL_PREFIX_TAG = "oai"
-
-# -------- 4. 订阅参数（一般无需修改）----------------------------------------
-SUBSCRIPTION_PLAN_NAME = "chatgptplusplan"
-SUBSCRIPTION_BILLING_COUNTRY = "ID"  # 印尼
-SUBSCRIPTION_CURRENCY = "IDR"
-# 1 个月免费试用的 promo campaign id；ChatGPT 后端会校验。
-# 如果该活动失效，需要抓包看新的活动 id。
-SUBSCRIPTION_PROMO_CAMPAIGN_ID = "plus-1-month-free"
-SUBSCRIPTION_CANCEL_URL = "https://chatgpt.com/#pricing"
-
-# ============================================================================
-# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲ 用户配置区域结束 ▲▲▲▲▲▲▲▲▲▲▲▲▲▲
-# ============================================================================
 
 
 # ===================== 库化配置(BotConfig)=====================
-# 当本脚本被项目代码 import 调用时(库模式),通过传入 ``BotConfig`` 来覆盖
-# 上方的 USER CONFIG 默认值;CLI 模式下若未显式构造,会自动从模块顶层常量
-# 构造一份 BotConfig 用于校验。
-#
-# 注意:GoPay 是单实体账号(单手机号 + 单 PIN),并发会撞同一账号 OTP/PIN,
+# GoPay 是单实体账号(单手机号 + 单 PIN),并发会撞同一账号 OTP/PIN,
 # 因此调用方必须保证全局串行,详见 plus_auto_register 模块。
 
 
@@ -138,9 +55,6 @@ SUBSCRIPTION_CANCEL_URL = "https://chatgpt.com/#pricing"
 class BotConfig:
     """注册机运行所需的全部可配置项,集中校验并禁止后续修改(frozen)。
 
-    :param temp_email_api: 自托管临时邮箱服务的 API 根地址(不含尾斜杠)。
-    :param temp_email_login_base: 临时邮箱 Web 登录入口,仅用于在 CLI 输出
-        自动登录链接;库模式下由调用方决定是否使用。
     :param gopay_phone: GoPay 注册手机号,纯数字,不带 + 与国家码,
         例 ``"13800138000"``。
     :param gopay_country_code: GoPay 手机国家码,纯数字字符串,
@@ -156,8 +70,6 @@ class BotConfig:
     :param subscription_cancel_url: 订阅取消跳转 URL,通常无需改动。
     """
 
-    temp_email_api: str
-    temp_email_login_base: str
     gopay_phone: str
     gopay_country_code: str
     gopay_pin: str
@@ -170,10 +82,7 @@ class BotConfig:
 
     def __post_init__(self) -> None:
         """构造时校验所有必填字段,禁止 ``YOUR_xxx`` 占位符与格式错误。"""
-        # 必填字符串校验:不能为空、不能含未替换的占位符
         required = {
-            "temp_email_api": self.temp_email_api,
-            "temp_email_login_base": self.temp_email_login_base,
             "gopay_phone": self.gopay_phone,
             "gopay_country_code": self.gopay_country_code,
             "gopay_pin": self.gopay_pin,
@@ -185,61 +94,12 @@ class BotConfig:
         if missing:
             raise ValueError("BotConfig 字段未配置或仍为占位符: " + ", ".join(missing))
 
-        # GoPay 手机号必须是纯数字
         if not self.gopay_phone.isdigit():
             raise ValueError("BotConfig.gopay_phone 必须是纯数字字符串(不带 + 与国家码)")
-
-        # GoPay 国家码必须是纯数字
         if not self.gopay_country_code.isdigit():
             raise ValueError("BotConfig.gopay_country_code 必须是纯数字字符串")
-
-        # GoPay PIN 必须是 6 位数字
         if len(self.gopay_pin) != 6 or not self.gopay_pin.isdigit():
             raise ValueError("BotConfig.gopay_pin 必须是 6 位数字字符串")
-
-
-def _build_cli_bot_config() -> "BotConfig":
-    """从模块顶层常量构造 BotConfig,供 CLI ``main()`` 在校验阶段使用。
-
-    :return: 基于当前 USER CONFIG 区域常量的 BotConfig 实例。
-    :raises ValueError: 当顶层常量仍含 ``YOUR_xxx`` 占位符或格式非法。
-    """
-    return BotConfig(
-        temp_email_api=TEMP_EMAIL_API,
-        temp_email_login_base=TEMP_EMAIL_LOGIN_BASE,
-        gopay_phone=GOPAY_PHONE,
-        gopay_country_code=GOPAY_COUNTRY_CODE,
-        gopay_pin=GOPAY_PIN,
-        email_prefix_tag=EMAIL_PREFIX_TAG,
-        subscription_plan_name=SUBSCRIPTION_PLAN_NAME,
-        subscription_billing_country=SUBSCRIPTION_BILLING_COUNTRY,
-        subscription_currency=SUBSCRIPTION_CURRENCY,
-        subscription_promo_campaign_id=SUBSCRIPTION_PROMO_CAMPAIGN_ID,
-        subscription_cancel_url=SUBSCRIPTION_CANCEL_URL,
-    )
-
-
-# ===================== 系统配置（一般不需要改）=====================
-CHATGPT_URL = "https://chatgpt.com"
-SCREENSHOTS_DIR = os.path.join(os.path.dirname(__file__), "screenshots")
-ACCOUNTS_FILE = os.path.join(os.path.dirname(__file__), "accounts.json")
-ACCOUNTS_TXT_FILE = os.path.join(os.path.dirname(__file__), "accounts.txt")
-
-os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
-
-
-# ===================== 启动校验：用户配置是否完整 =====================
-def _validate_user_config():
-    """启动时检查 USER CONFIG 区域是否还有未填写的 YOUR_xxx 占位符。
-
-    :raises SystemExit: 缺失/非法配置时打印中文指引并退出(CLI 行为)。
-    """
-    try:
-        _build_cli_bot_config()
-    except ValueError as exc:
-        raise SystemExit(
-            "\n[配置缺失或非法] " + str(exc) + "\n请检查脚本顶部「用户配置区域」(USER CONFIG)的所有 YOUR_xxx 占位符。\n"
-        )
 
 
 # ===================== 工具函数 =====================
@@ -440,8 +300,8 @@ async def log_page_state(page: Page, step_name: str):
 
 
 # ===================== 自定义异常 =====================
-class TempEmailError(Exception):
-    pass
+class MailboxError(Exception):
+    """邮箱创建 / 取信 / 提取验证码 / 清理流程错误。"""
 
 
 class SignupFlowError(Exception):
@@ -456,193 +316,6 @@ class VerificationTimeout(Exception):
     pass
 
 
-# ===================== 1. 验证码提取器 =====================
-class VerificationCodeExtractor:
-    PATTERNS = [
-        (r"\b(\d{6})\b", "6-digit code"),
-        (r">(\d{6})<", "6-digit inside tags"),
-        (r"\b(\d{5})\b", "5-digit code"),
-        (r"\b(\d{4})\b", "4-digit code"),
-        (r"\b(\d{8})\b", "8-digit code"),
-        (r"code[:\s]*(\d{4,8})", "'code: XXXX' (case insensitive)"),
-        (r"OTP[:\s]*(\d{4,8})", "'OTP: XXXX' (case insensitive)"),
-        (r"verification[^0-9]*(\d{4,8})", "'verification code: XXXX'"),
-        (r"confirm[^0-9]*(\d{4,8})", "'confirm: XXXX'"),
-        (r"(\d{4,8})\s*is your", "'XXXX is your code'"),
-        (r"验证码[:\s]*(\d{4,8})", "中文验证码"),
-        (r"kode[:\s]*(\d{4,8})", "'kode: XXXX' (Bahasa)"),
-    ]
-
-    @staticmethod
-    def _strip_html(text: str) -> str:
-        return re.sub(r"<[^>]+>", " ", text)
-
-    @classmethod
-    def extract_from_text(cls, text: str) -> str | None:
-        if not text:
-            return None
-        clean = cls._strip_html(text)
-        for pattern, _desc in cls.PATTERNS:
-            match = re.search(pattern, clean, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        return None
-
-    @classmethod
-    def extract_from_subject(cls, subject: str) -> str | None:
-        if not subject:
-            return None
-        return cls.extract_from_text(subject)
-
-    @classmethod
-    def extract_from_html(cls, html: str) -> str | None:
-        if not html:
-            return None
-        # 从 <b>/<strong> 标签或数字串中提取
-        bold_match = re.search(r"<b[^>]*>(\d{4,8})</b>", html, re.IGNORECASE)
-        if bold_match:
-            return bold_match.group(1)
-        strong_match = re.search(r"<strong[^>]*>(\d{4,8})</strong>", html, re.IGNORECASE)
-        if strong_match:
-            return strong_match.group(1)
-        return cls.extract_from_text(html)
-
-    @classmethod
-    def find_verification_link(cls, text: str, html: str) -> str | None:
-        content = (html or "") + (text or "")
-        urls = re.findall(r"https?://[^\s<>\"'\)]+", content)
-        for url in urls:
-            if any(k in url.lower() for k in ("verify", "confirm", "activate", "email-verification")):
-                return url
-        return None
-
-    @classmethod
-    def comprehensive_extract(cls, mail: dict) -> dict | None:
-        subject = mail.get("subject", "")
-        text_body = mail.get("text", "")
-        html_body = mail.get("html", "")
-
-        for source, content in [("subject", subject), ("text", text_body), ("html", html_body)]:
-            code = cls.extract_from_text(content)
-            if code:
-                return {"code": code, "source": source}
-
-        link = cls.find_verification_link(text_body, html_body)
-        if link:
-            code_from_link = cls.extract_from_text(link)
-            if code_from_link:
-                return {"code": code_from_link, "source": "link"}
-
-        return None
-
-
-# ===================== 2. 临时邮箱客户端 =====================
-class TempEmailClient:
-    """自托管临时邮箱服务客户端。
-
-    支持库模式(传 ``BotConfig``)与 CLI 模式(回退 ``TEMP_EMAIL_API``)。
-    """
-
-    _session: "aiohttp.ClientSession | None" = None
-
-    def __init__(self, config: Optional["BotConfig"] = None) -> None:
-        """初始化客户端。
-
-        :param config: 库模式下传入 BotConfig 以覆盖默认 API 地址;
-            CLI 模式可省略,自动回退到模块顶层 ``TEMP_EMAIL_API``。
-        """
-        self.base = config.temp_email_api if config else TEMP_EMAIL_API
-
-    async def __aenter__(self):
-        if aiohttp is None:
-            raise TempEmailError("缺少 aiohttp 依赖。请安装:`pip install aiohttp` 或 `uv add aiohttp`")
-        self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30),
-            connector=aiohttp.TCPConnector(limit=5),
-        )
-        return self
-
-    async def __aexit__(self, *args):
-        if self._session:
-            await self._session.close()
-
-    def _assert_session(self) -> "aiohttp.ClientSession":
-        if not self._session:
-            raise TempEmailError("Session 未初始化，使用 async with TempEmailClient() as client:")
-        return self._session
-
-    @staticmethod
-    def sha256(text: str) -> str:
-        return hashlib.sha256(text.encode()).hexdigest()
-
-    async def create_address(self, name: str = "") -> dict:
-        s = self._assert_session()
-        payload = {"name": name} if name else {}
-        async with s.post(f"{self.base}/api/new_address", json=payload) as resp:
-            if resp.status == 429:
-                raise TempEmailError("API 限流 (429)")
-            body = await resp.json()
-            if resp.status != 200:
-                raise TempEmailError(f"创建地址失败: {resp.status} {body}")
-            logger.info(f"✅ 临时邮箱: {body['address']}  (password: {body.get('password', 'N/A')})")
-            return body
-
-    async def poll_for_emails(self, jwt: str, timeout: int = 120, interval: int = 5) -> list:
-        s = self._assert_session()
-        headers = {"Authorization": f"Bearer {jwt}"}
-        seen_ids = set()
-        deadline = time.time() + timeout
-
-        logger.info(f"等待验证邮件... (最长 {timeout}s)")
-
-        while time.time() < deadline:
-            try:
-                async with s.get(
-                    f"{self.base}/api/parsed_mails", params={"offset": "0", "limit": "10"}, headers=headers
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"查询邮件失败: {resp.status}")
-                        await asyncio.sleep(interval)
-                        continue
-                    data = await resp.json()
-                    results = data.get("results", [])
-                    new_mails = [m for m in results if m.get("id") not in seen_ids]
-
-                    if new_mails:
-                        for m in new_mails:
-                            seen_ids.add(m["id"])
-                            logger.info(
-                                f"📧 新邮件 #{m['id']}: from={m.get('source', '?')[:50]} subj={m.get('subject', '?')[:60]}"
-                            )
-                        if results:
-                            return results
-
-            except Exception as e:
-                logger.warning(f"轮询异常: {e}")
-
-            await asyncio.sleep(interval)
-
-        raise VerificationTimeout(f"{timeout}s 内未收到邮件")
-
-    async def get_parsed_mail(self, jwt: str, mail_id: int) -> dict:
-        s = self._assert_session()
-        headers = {"Authorization": f"Bearer {jwt}"}
-        async with s.get(f"{self.base}/api/parsed_mail/{mail_id}", headers=headers) as resp:
-            if resp.status != 200:
-                raise TempEmailError(f"获取邮件失败: {resp.status}")
-            return await resp.json()
-
-    async def address_login(self, email_addr: str, plaintext_password: str) -> dict:
-        s = self._assert_session()
-        hashed = self.sha256(plaintext_password)
-        payload = {"email": email_addr, "password": hashed}
-        async with s.post(f"{self.base}/api/address_login", json=payload) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                raise TempEmailError(f"登录失败: {resp.status} {body}")
-            return await resp.json()
-
-
 # ===================== 3. ChatGPT 浏览器自动化 =====================
 class ChatGPTBot:
     CHATGPT_URL = "https://chatgpt.com"
@@ -652,14 +325,13 @@ class ChatGPTBot:
         headless: bool = False,
         slow_mo: int = 100,
         *,
-        config: Optional["BotConfig"] = None,
+        config: "BotConfig",
     ):
         """初始化浏览器自动化机器人。
 
         :param headless: 是否启用无头浏览器。
         :param slow_mo: Playwright slow_mo 参数(ms),便于观察。
-        :param config: 库模式下的 BotConfig 实例;CLI 模式可省略,自动回退
-            到模块顶层 GoPay/Subscription 常量。
+        :param config: 必填,所有 GoPay / 订阅参数通过 BotConfig 注入。
         """
         self.headless = headless
         self.slow_mo = slow_mo
@@ -667,17 +339,17 @@ class ChatGPTBot:
         self.context: BrowserContext | None = None
         self.page: Page | None = None
         self.playwright = None
-        # 注册时填的姓名，支付时用于 Stripe 账单字段
+        # 注册时填的姓名,支付时用于 Stripe 账单字段
         self.registration_name: str = ""
-        # 配置项:库模式注入 BotConfig,CLI 模式回退到模块顶层常量
-        self._gopay_phone = config.gopay_phone if config else GOPAY_PHONE
-        self._gopay_country_code = config.gopay_country_code if config else GOPAY_COUNTRY_CODE
-        self._gopay_pin = config.gopay_pin if config else GOPAY_PIN
-        self._sub_plan_name = config.subscription_plan_name if config else SUBSCRIPTION_PLAN_NAME
-        self._sub_billing_country = config.subscription_billing_country if config else SUBSCRIPTION_BILLING_COUNTRY
-        self._sub_currency = config.subscription_currency if config else SUBSCRIPTION_CURRENCY
-        self._sub_promo_id = config.subscription_promo_campaign_id if config else SUBSCRIPTION_PROMO_CAMPAIGN_ID
-        self._sub_cancel_url = config.subscription_cancel_url if config else SUBSCRIPTION_CANCEL_URL
+        # 配置项全部从 BotConfig 注入(本模块迁入项目后不再保留 CLI 模块全局回退)
+        self._gopay_phone = config.gopay_phone
+        self._gopay_country_code = config.gopay_country_code
+        self._gopay_pin = config.gopay_pin
+        self._sub_plan_name = config.subscription_plan_name
+        self._sub_billing_country = config.subscription_billing_country
+        self._sub_currency = config.subscription_currency
+        self._sub_promo_id = config.subscription_promo_campaign_id
+        self._sub_cancel_url = config.subscription_cancel_url
 
     async def __aenter__(self):
         await self.launch()
@@ -843,6 +515,47 @@ class ChatGPTBot:
                 logger.warning(f"年龄候选输入失败: {e}")
         return False
 
+    async def _find_signup_email_input(self):
+        """查找注册流程中的邮箱输入框,兼容 dialog 与 auth.openai.com 整页表单。"""
+        for sel in [
+            self.page.get_by_role("textbox", name=re.compile(r"(电子邮件|email)", re.IGNORECASE)).first,
+            self.page.locator('input[type="email"]').first,
+            self.page.locator('input[name="email"]').first,
+            self.page.locator('input[autocomplete="email"]').first,
+            self.page.locator('input[id*="email" i]').first,
+            self.page.get_by_placeholder(re.compile(r"(电子邮件|邮箱|email)", re.IGNORECASE)).first,
+        ]:
+            try:
+                if await sel.is_visible(timeout=1200):
+                    return sel
+            except Exception:
+                continue
+        return None
+
+    async def _click_email_auth_option_if_visible(self) -> bool:
+        """点击 ChatGPT 新登录弹窗中的邮箱方式入口,避免误点第三方登录。"""
+        email_option_re = re.compile(
+            r"^(使用(?:电子邮箱|电子邮件|邮箱)继续|继续使用(?:电子邮箱|电子邮件|邮箱)|"
+            r"Continue with (?:email|e-mail)(?: address)?|Email|E-mail)$",
+            re.IGNORECASE,
+        )
+        for sel in [
+            self.page.get_by_role("button", name=email_option_re).first,
+            self.page.get_by_role("link", name=email_option_re).first,
+            self.page.locator('button:has-text("使用电子邮箱继续")').first,
+            self.page.locator('button:has-text("Continue with email")').first,
+            self.page.locator('a:has-text("使用电子邮箱继续")').first,
+            self.page.locator('a:has-text("Continue with email")').first,
+        ]:
+            try:
+                if await sel.is_visible(timeout=800):
+                    await sel.click(timeout=3000)
+                    logger.info("[Plus注册] 已点击邮箱方式入口")
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def navigate_to_signup(self, email: str) -> bool:
         logger.info(f"导航到 ChatGPT 注册页, 邮箱={email}")
 
@@ -899,22 +612,12 @@ class ChatGPTBot:
         attempt = 0
         while asyncio.get_event_loop().time() < deadline:
             attempt += 1
-            for sel in [
-                self.page.get_by_role("textbox", name=re.compile(r"(电子邮件|email)", re.IGNORECASE)).first,
-                self.page.locator('input[type="email"]').first,
-                self.page.locator('input[name="email"]').first,
-                self.page.locator('input[autocomplete="email"]').first,
-                self.page.locator('input[id*="email" i]').first,
-                self.page.get_by_placeholder(re.compile(r"(电子邮件|邮箱|email)", re.IGNORECASE)).first,
-            ]:
-                try:
-                    if await sel.is_visible(timeout=1200):
-                        email_input = sel
-                        break
-                except Exception:
-                    continue
+            email_input = await self._find_signup_email_input()
             if email_input:
                 break
+            if await self._click_email_auth_option_if_visible():
+                await self._random_delay(800, 1500)
+                continue
             # 偶尔可能页面跳转到了 auth.openai.com 但 DOM 还在加载，多等一下
             await asyncio.sleep(1)
 
@@ -1242,7 +945,7 @@ class ChatGPTBot:
         logger.info("等待 OAuth 回调返回 chatgpt.com...")
         # 先检查是否已经回到了 chatgpt.com
         url = self.page.url
-        if CHATGPT_URL in url and "callback" not in url and "auth" not in url:
+        if self.CHATGPT_URL in url and "callback" not in url and "auth" not in url:
             logger.info(f"已在 chatgpt.com: {url[:100]}")
             await self._random_delay(2000, 3000)
             return await self._check_session()
@@ -1302,7 +1005,7 @@ class ChatGPTBot:
             logger.warning(f"Session 检查失败: {e}")
 
         # 保底：URL 确认
-        if CHATGPT_URL in self.page.url:
+        if self.CHATGPT_URL in self.page.url:
             logger.info("保底确认：已在 chatgpt.com")
             return True
         return False
@@ -2023,154 +1726,14 @@ class ChatGPTBot:
             return False
 
 
-# ===================== 4. 账号管理器 =====================
-class AccountManager:
-    FILE = ACCOUNTS_FILE
-    TXT_FILE = ACCOUNTS_TXT_FILE
-
-    @classmethod
-    def load_accounts(cls) -> list:
-        if not os.path.exists(cls.FILE):
-            return []
-        try:
-            with open(cls.FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return []
-
-    @staticmethod
-    def _disp_width(s: str) -> int:
-        """计算字符串在等宽终端下的显示宽度。CJK 全角字符算 2 列，其他算 1 列。"""
-        w = 0
-        for ch in s:
-            cp = ord(ch)
-            if (
-                0x1100 <= cp <= 0x115F  # Hangul Jamo
-                or 0x2E80 <= cp <= 0x9FFF  # CJK
-                or 0xA000 <= cp <= 0xA4CF
-                or 0xAC00 <= cp <= 0xD7A3  # Hangul Syllables
-                or 0xF900 <= cp <= 0xFAFF
-                or 0xFE30 <= cp <= 0xFE4F
-                or 0xFF00 <= cp <= 0xFF60
-                or 0xFFE0 <= cp <= 0xFFE6
-            ):
-                w += 2
-            else:
-                w += 1
-        return w
-
-    @classmethod
-    def _pad(cls, s: str, width: int) -> str:
-        """左对齐，按显示宽度补空格。"""
-        diff = width - cls._disp_width(s)
-        return s + (" " * diff if diff > 0 else "")
-
-    @classmethod
-    def _fmt_time(cls, iso: str) -> str:
-        """ISO UTC 时间 → 本地时间 'YYYY-MM-DD HH:MM:SS'。"""
-        try:
-            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-            return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            return iso[:19] if iso else ""
-
-    @classmethod
-    def write_txt_dump(cls, accounts: list) -> None:
-        """根据全部账号重写 accounts.txt。
-
-        每个账号 4 行：邮箱:、密码:、时间:、登录地址:；账号之间用空行分隔。
-        4 个标签按显示宽度补齐，使后面的冒号 + 值竖直对齐。
-        """
-        labels = ["邮箱", "密码", "时间", "登录地址"]
-        label_w = max(cls._disp_width(lb) for lb in labels)
-
-        def line(label: str, value: str) -> str:
-            # "<label>:<空格补齐>  <value>"  —— 冒号紧贴 label，再补空格后接 value
-            return cls._pad(label + ":", label_w + 1) + "  " + value
-
-        chunks = [
-            f"# ChatGPT 注册账号清单（共 {len(accounts)} 个，最近一次更新: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}）",
-            "",
-        ]
-        for a in accounts:
-            chunks.append(line("邮箱", a.get("email", "")))
-            chunks.append(line("密码", a.get("password", "")))
-            chunks.append(line("时间", cls._fmt_time(a.get("created_at", ""))))
-            chunks.append(line("登录地址", a.get("auto_login_url", "")))
-            chunks.append("")  # 账号之间空行
-
-        content = "\n".join(chunks)
-        if not content.endswith("\n"):
-            content += "\n"
-        with open(cls.TXT_FILE, "w", encoding="utf-8") as f:
-            f.write(content)
-
-    @classmethod
-    def save_account(cls, account: dict) -> None:
-        accounts = cls.load_accounts()
-        accounts.append(account)
-        with open(cls.FILE, "w", encoding="utf-8") as f:
-            json.dump(accounts, f, ensure_ascii=False, indent=2)
-        try:
-            cls.write_txt_dump(accounts)
-            logger.info(f"✅ 账号已保存到 {cls.FILE} 与 {cls.TXT_FILE} ({len(accounts)} 个账号)")
-        except Exception as e:
-            logger.warning(f"写入 TXT 失败（JSON 已保存）: {e}")
-            logger.info(f"✅ 账号已保存到 {cls.FILE} ({len(accounts)} 个账号)")
-
-    @staticmethod
-    def generate_auto_login_url(address: str, jwt: str) -> str:
-        return f"{TEMP_EMAIL_LOGIN_BASE}?jwt={jwt}"
-
-    @classmethod
-    def create_account(
-        cls,
-        email: str,
-        chatgpt_password: str,
-        temp_email_password: str,
-        jwt: str,
-    ) -> dict:
-        account = {
-            "email": email,
-            "password": chatgpt_password,
-            "temp_email_password": temp_email_password,
-            "jwt": jwt,
-            "auto_login_url": cls.generate_auto_login_url(email, jwt),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
-        cls.save_account(account)
-        return account
-
-
-# ===================== 5. WhatsApp OTP 处理器 =====================
-class WhatsAppOTPHandler:
-    @staticmethod
-    async def prompt_user_for_otp(timeout: int = 120) -> str | None:
-        logger.info("=" * 60)
-        logger.info("等待 GoPay OTP - 请检查 WhatsApp/短信")
-        logger.info(f"请在 {timeout}s 内输入 OTP 验证码:")
-        logger.info("=" * 60)
-
-        loop = asyncio.get_running_loop()
-        try:
-            result = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: input("OTP > ").strip()),
-                timeout=timeout,
-            )
-            if result:
-                logger.info(f"收到 OTP: {result[:2]}...")
-                return result
-            return None
-        except asyncio.TimeoutError:
-            logger.warning("OTP 输入超时")
-            return None
-
-
 # ===================== 6. 库模式入口(register_one_plus) =====================
 async def register_one_plus(
     config: BotConfig,
     otp_callback: Callable[[], Awaitable[str | None]],
     *,
+    create_mailbox: Callable[[], Awaitable[dict[str, Any]]],
+    fetch_email_code: Callable[[dict[str, Any], int], Awaitable[str | None]],
+    cleanup_mailbox: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     headless: bool = True,
     slow_mo: int = 100,
     step_callback: Callable[[str], None] | None = None,
@@ -2181,14 +1744,14 @@ async def register_one_plus(
 ) -> dict[str, Any]:
     """库模式入口:跑一次完整 ChatGPT 注册 + GoPay 付款 + 设密码 + 取消续订。
 
-    与 CLI ``main()`` 的关键差异:
-        - 不写 ``accounts.json`` / ``accounts.txt``(库模式由调用方决定持久化);
-        - WhatsApp OTP 通过 ``otp_callback`` 注入(任意异步源,如 asyncio.Queue);
-        - 进度通过 ``step_callback`` 同步回流(避免 Playwright 异步上下文扩散);
-        - 失败不抛出异常,统一返回结构化结果便于上层路由 / 持久化决策。
+    临时邮箱完全通过 callback 注入,本模块不关心具体 provider 是 cloudmail
+    还是 cloudflare_temp_email;调用方负责 wrap ``mail_provider`` 同步 client。
 
-    :param config: 已校验的 BotConfig,所有 USER CONFIG 必须显式传入。
+    :param config: 已校验的 BotConfig,所有 GoPay / 订阅参数必须显式传入。
     :param otp_callback: 异步 OTP 提供者;返回 ``None`` 视作超时,会触发付款失败。
+    :param create_mailbox: 创建临时邮箱,返回至少含 ``email`` 字段的 dict。
+    :param fetch_email_code: 等待并提取验证码;返回 ``None`` 视作未能提取。
+    :param cleanup_mailbox: best-effort 清理邮箱 callback;可为 ``None``。
     :param headless: 是否无头模式,默认 ``True``(服务端建议保持)。
     :param slow_mo: Playwright slow_mo(ms)。
     :param step_callback: 进度回调(同步函数),参数为当前 step 名,
@@ -2200,15 +1763,13 @@ async def register_one_plus(
     :return: 字典 ``{ok, email, password, last_step, error_type, error_detail}``,
         ``ok=True`` 时 email/password 必填;失败时 email 可能为空。
     """
-    # 库模式:正则化默认值,避免依赖模块全局
     chatgpt_password = chatgpt_password or generate_strong_password(16)
     birthdate = birthdate or generate_birthdate()
     real_name = name or generate_real_name()
-    email_prefix = generate_email_prefix(tag=config.email_prefix_tag)
 
-    # 出参容器,失败时也要带上已经拿到的 email
     address: str = ""
     last_step = "creating_email"
+    mailbox: dict[str, Any] | None = None
 
     def _step(name: str) -> None:
         """安全地推进 step,异常不影响主流程。"""
@@ -2230,8 +1791,6 @@ async def register_one_plus(
             "error_detail": error_detail,
         }
 
-    # 包装 OTP callback:取 OTP 前先回流 step;返回 None 时抛 PaymentError
-    # (避免 bot 内部 6 分钟轮询)。
     async def _wrapped_otp_callback() -> str:
         _step("awaiting_whatsapp_otp")
         otp = await otp_callback()
@@ -2240,60 +1799,52 @@ async def register_one_plus(
         return otp
 
     try:
-        # Step 1:临时邮箱
         _step("creating_email")
-        async with TempEmailClient(config=config) as email_client:
-            email_meta = await retry_with_backoff(
-                lambda: email_client.create_address(name=email_prefix),
-                max_retries=3,
-                description="创建临时邮箱",
-            )
-            address = email_meta["address"]
-            jwt = email_meta["jwt"]
+        mailbox = await retry_with_backoff(
+            lambda: create_mailbox(),
+            max_retries=3,
+            description="创建临时邮箱",
+        )
+        address = str((mailbox or {}).get("email") or "")
+        if not address:
+            raise MailboxError("邮箱创建成功但返回结果缺少 email 字段")
 
-        # Step 2-7:ChatGPT 注册全流程
         async with ChatGPTBot(headless=headless, slow_mo=slow_mo, config=config) as bot:
             _step("signing_up")
             await bot.navigate_to_signup(address)
             await bot.wait_for_verification_page()
 
             _step("awaiting_email_otp")
-            async with TempEmailClient(config=config) as email_client:
-                mails = await email_client.poll_for_emails(jwt, timeout=email_timeout, interval=5)
-
-            extractor = VerificationCodeExtractor()
-            code_info = None
-            sorted_mails = sorted(mails, key=lambda m: m.get("created_at", ""), reverse=True)
-            for mail in sorted_mails:
-                code_info = extractor.comprehensive_extract(mail)
-                if code_info:
-                    break
-            if not code_info:
-                # 库模式不提供 stdin fallback,直接返回失败
+            code = await fetch_email_code(mailbox, email_timeout)
+            if not code:
                 return _result(
-                    False, error_type="email_otp_extract_failed", error_detail="邮件已收到但未能自动提取验证码"
+                    False,
+                    error_type="email_otp_extract_failed",
+                    error_detail="邮件已收到但未能自动提取验证码",
                 )
 
             _step("filling_about_you")
-            await bot.enter_verification_code(code_info["code"])
+            await bot.enter_verification_code(code)
             await bot.fill_about_you(name=real_name, birthdate=birthdate)
 
             logged_in = await bot.wait_for_login_complete()
             if not logged_in:
                 return _result(
-                    False, error_type="signup_failed", error_detail="ChatGPT 登录态校验失败(session 无 accessToken)"
+                    False,
+                    error_type="signup_failed",
+                    error_detail="ChatGPT 登录态校验失败(session 无 accessToken)",
                 )
 
-            # Step 8-9:GoPay 付款(WhatsApp OTP 在内部触发 _wrapped_otp_callback)
             _step("paying_gopay")
             await bot.execute_gopay_payment()
             payment_result = await bot.handle_stripe_checkout(whatsapp_callback=_wrapped_otp_callback)
             if payment_result != "success":
                 return _result(
-                    False, error_type="payment_failed", error_detail=f"Stripe/Midtrans 流程未成功: {payment_result}"
+                    False,
+                    error_type="payment_failed",
+                    error_detail=f"Stripe/Midtrans 流程未成功: {payment_result}",
                 )
 
-            # Step 10-11:设密码 + 取消续订
             _step("setting_password")
             await bot.add_password_login(chatgpt_password)
 
@@ -2305,228 +1856,20 @@ async def register_one_plus(
 
     except VerificationTimeout as exc:
         return _result(False, error_type="email_otp_timeout", error_detail=str(exc))
-    except TempEmailError as exc:
-        # 邮件相关异常按当前 step 区分;若 last_step 还在 creating_email 才算 create 失败
+    except MailboxError as exc:
         et = "email_create_failed" if last_step == "creating_email" else "email_poll_failed"
         return _result(False, error_type=et, error_detail=str(exc))
     except SignupFlowError as exc:
         return _result(False, error_type="signup_failed", error_detail=str(exc))
     except PaymentError as exc:
-        # 区分 WhatsApp OTP 超时 vs 一般付款失败
         if last_step == "awaiting_whatsapp_otp":
             return _result(False, error_type="whatsapp_otp_timeout", error_detail=str(exc))
         return _result(False, error_type="payment_failed", error_detail=str(exc))
     except asyncio.CancelledError:
-        # 调用方主动 cancel:返回结构化结果而非抛出,便于 job 状态记账
         return _result(False, error_type="cancelled", error_detail="任务被调用方取消")
-
-
-# ===================== 7. CLI 主流程 =====================
-async def main():
-    parser = argparse.ArgumentParser(description="ChatGPT 注册机")
-    parser.add_argument("--headless", action="store_true", help="无头模式")
-    parser.add_argument("--slow-mo", type=int, default=100, help="操作延迟(ms)")
-    parser.add_argument("--password", type=str, default=None, help="指定 ChatGPT 密码")
-    parser.add_argument("--name", type=str, default=DEFAULT_NAME, help="账号名称。保持默认时会随机生成英文姓名")
-    parser.add_argument("--birthdate", type=str, default=None, help="生日 YYYY-MM-DD")
-    parser.add_argument("--email-timeout", type=int, default=180, help="邮件等待超时(s)")
-    parser.add_argument("--skip-payment", action="store_true", help="跳过支付，仅注册免费账户")
-    parser.add_argument("--debug", action="store_true", help="调试模式：出错时保持浏览器打开不关闭")
-    parser.add_argument("--email", type=str, default=None, help="复用已有邮箱（跳过创建）")
-    parser.add_argument("--jwt", type=str, default=None, help="已有邮箱的JWT")
-    parser.add_argument("--temp-password", type=str, default="", help="已有邮箱临时密码")
-    args = parser.parse_args()
-    global DEBUG_MODE
-    DEBUG_MODE = args.debug
-
-    # 启动前校验 USER CONFIG 是否完整
-    _validate_user_config()
-
-    chatgpt_password = args.password or generate_strong_password(16)
-    birthdate = args.birthdate or generate_birthdate()
-    real_name = args.name if args.name != DEFAULT_NAME else generate_real_name()
-    email_prefix = generate_email_prefix()
-
-    print("=" * 60)
-    print("ChatGPT 注册机")
-    print("=" * 60)
-    print(f"邮箱 API: {TEMP_EMAIL_API}")
-    print(f"邮箱前缀: {email_prefix}")
-    print(f"ChatGPT密码: {chatgpt_password}")
-    print(f"姓名: {real_name}")
-    print(f"生日: {birthdate}")
-    print(f"跳过支付: {args.skip_payment}")
-    print("=" * 60)
-
-    # 存储各步骤结果
-    address = None
-    jwt = None
-    temp_password = None
-
-    try:
-        # Step 1: 创建或复用临时邮箱
-        if args.email and args.jwt:
-            address = args.email
-            jwt = args.jwt
-            temp_password = args.temp_password or ""
-            logger.info(f"复用已有邮箱: {address}")
-        else:
-            logger.info("第 1 步: 创建临时邮箱")
-            async with TempEmailClient() as email_client:
-                result = await retry_with_backoff(
-                    lambda: email_client.create_address(name=email_prefix), max_retries=3, description="创建地址"
-                )
-                address = result["address"]
-                jwt = result["jwt"]
-                temp_password = result.get("password") or ""
-
-        # Step 2-7: ChatGPT 注册
-        logger.info("第 2 步: ChatGPT 注册")
-        async with ChatGPTBot(headless=args.headless, slow_mo=args.slow_mo) as bot:
-            await bot.navigate_to_signup(address)
-            await bot.wait_for_verification_page()
-
-            # Step 3: 等验证邮件并提取验证码
-            logger.info("第 3 步: 等待验证邮件...")
-            async with TempEmailClient() as email_client:
-                mails = await email_client.poll_for_emails(jwt, timeout=args.email_timeout, interval=5)
-
-            logger.info("第 4 步: 提取验证码")
-            extractor = VerificationCodeExtractor()
-            code_info = None
-            sorted_mails = sorted(mails, key=lambda m: m.get("created_at", ""), reverse=True)
-            for mail in sorted_mails:
-                code_info = extractor.comprehensive_extract(mail)
-                if code_info:
-                    logger.info(f"✅ 验证码: {code_info['code'][:3]}... (source={code_info['source']})")
-                    break
-
-            if not code_info:
-                logger.warning("自动提取失败，等待手动输入...")
-                loop = asyncio.get_running_loop()
-                manual_code = await loop.run_in_executor(None, lambda: input("请输入邮箱验证码 (手动) > ").strip())
-                code_info = {"code": manual_code, "source": "manual"}
-
-            # Step 5: 输入验证码
-            logger.info("第 5 步: 输入验证码")
-            await bot.enter_verification_code(code_info["code"])
-
-            # Step 6: 填写 about-you
-            logger.info("第 6 步: about-you")
-            await bot.fill_about_you(name=real_name, birthdate=birthdate)
-
-            # Step 7: 等待登录完成
-            logger.info("第 7 步: 等待登录完成")
-            logged_in = await bot.wait_for_login_complete()
-            if not logged_in:
-                logger.error("登录验证失败，保存部分进度后退出")
-                AccountManager.create_account(
-                    email=address,
-                    chatgpt_password=chatgpt_password,
-                    temp_email_password=temp_password,
-                    jwt=jwt,
-                )
-                return
-
-            if args.skip_payment:
-                logger.info("跳过支付，保存账号信息")
-                AccountManager.create_account(
-                    email=address,
-                    chatgpt_password=chatgpt_password,
-                    temp_email_password=temp_password,
-                    jwt=jwt,
-                )
-                print("\n" + "=" * 60)
-                print("免费账户注册完成 (无 Plus)")
-                print(f"邮箱: {address}")
-                print(f"密码: {chatgpt_password}")
-                print("=" * 60)
-                return
-
-            # Step 8-9: 支付
-            logger.info("第 8 步: GoPay 支付")
-            await bot.execute_gopay_payment()
-
-            logger.info("第 9 步: 处理 Stripe + Midtrans 结账")
-            payment_result = await bot.handle_stripe_checkout(whatsapp_callback=WhatsAppOTPHandler.prompt_user_for_otp)
-
-            if payment_result != "success":
-                logger.error(f"支付未成功: {payment_result}")
-                print(f"\n支付状态: {payment_result}")
-                print("保存部分进度...")
-                AccountManager.create_account(
-                    email=address,
-                    chatgpt_password=chatgpt_password,
-                    temp_email_password=temp_password,
-                    jwt=jwt,
-                )
-                return
-
-            # Step 10: 设置密码
-            logger.info("第 10 步: 设置密码")
-            await bot.add_password_login(chatgpt_password)
-
-            # Step 11: 取消订阅
-            logger.info("第 11 步: 取消订阅")
-            await bot.cancel_subscription()
-
-        # Step 12: 保存
-        logger.info("第 12 步: 保存账号")
-        AccountManager.create_account(
-            email=address,
-            chatgpt_password=chatgpt_password,
-            temp_email_password=temp_password,
-            jwt=jwt,
-        )
-
-        print("\n" + "=" * 60)
-        print("🎉 注册完成！")
-        print(f"📧 邮箱: {address}")
-        print(f"🔑 密码: {chatgpt_password}")
-        print(f"🔗 自动登录: {TEMP_EMAIL_LOGIN_BASE}?jwt={jwt[:20]}...")
-        print(f"📁 账号文件: {ACCOUNTS_FILE}")
-        print("=" * 60)
-
-    except VerificationTimeout as e:
-        logger.error(f"验证邮件超时: {e}")
-        if address and jwt:
-            AccountManager.create_account(
-                email=address,
-                chatgpt_password=chatgpt_password,
-                temp_email_password=temp_password or "",
-                jwt=jwt,
-            )
-
-    except (TempEmailError, SignupFlowError, PaymentError) as e:
-        logger.error(f"注册流程失败: {type(e).__name__}: {e}")
-        if address and jwt:
-            AccountManager.create_account(
-                email=address,
-                chatgpt_password=chatgpt_password,
-                temp_email_password=temp_password or "",
-                jwt=jwt,
-            )
-
-    except KeyboardInterrupt:
-        logger.info("用户中断，保存部分进度...")
-        if address and jwt:
-            AccountManager.create_account(
-                email=address,
-                chatgpt_password=chatgpt_password,
-                temp_email_password=temp_password or "",
-                jwt=jwt,
-            )
-
-    except Exception as e:
-        logger.exception(f"未预期的错误: {e}")
-        if address and jwt:
-            AccountManager.create_account(
-                email=address,
-                chatgpt_password=chatgpt_password,
-                temp_email_password=temp_password or "",
-                jwt=jwt,
-            )
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    finally:
+        if mailbox and cleanup_mailbox is not None:
+            try:
+                await cleanup_mailbox(mailbox)
+            except Exception as exc:  # pragma: no cover - best-effort 清理
+                logger.warning("清理临时邮箱失败,可忽略: %s", exc)

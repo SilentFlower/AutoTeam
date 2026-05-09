@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "提交前自检清单(ruff/pytest/compileall)是 check 通过门槛。"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "lint/format/test 命令与 PR/commit 规范。"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "校验异常类选择(RuntimeError/ValueError 优先);校验"双阶段失败语义"真例路径已更新到 plus_register_bot。"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "校验日志中无 OTP/PIN/token/password 明文;模块前缀风格保持一致。"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "校验新模块在 src/autoteam/ 扁平根下,snake_case 文件名,业务逻辑不被错放进 api.py 端点函数。"}
+{"file": ".trellis/tasks/05-08-plus-bot-mail-provider-httpx/prd.md", "reason": "Acceptance Criteria(R1-R7 + AC 8 项)是本任务最终验收清单。"}
+{"file": ".trellis/tasks/05-08-plus-oauth-sub2api/research/registration-bot-mapping.md", "reason": "校验删除清单(~700 行)与保留清单(~1785 行)对得上,没误删 ChatGPTBot 业务逻辑。"}
